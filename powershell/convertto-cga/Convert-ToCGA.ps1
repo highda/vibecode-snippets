@@ -19,7 +19,7 @@ $script:previewPaletteFile = $null
 $script:previewTimer = $null
 $script:pendingUpdate = $false
 $script:lastFilterValue = $Filter
-$script:inputFiles = @() # New variable to store multiple file paths
+$script:inputFiles = @()
 
 # Define the full path to the magick.exe executable
 $magickPath = Join-Path -Path $PSScriptRoot -ChildPath "magick.exe"
@@ -111,6 +111,19 @@ function Show-OptionsDialog {
     $lblIntro.Size = New-Object System.Drawing.Size(280, 20)
     $pnlSettings.Controls.Add($lblIntro)
 
+    # File selection dropdown for batch mode
+    $lblFileSelect = New-Object System.Windows.Forms.Label
+    $lblFileSelect.Text = "Preview File:"
+    $lblFileSelect.Location = New-Object System.Drawing.Point(10, 40)
+    $lblFileSelect.Size = New-Object System.Drawing.Size(100, 20)
+    $pnlSettings.Controls.Add($lblFileSelect)
+    
+    $cmbFiles = New-Object System.Windows.Forms.ComboBox
+    $cmbFiles.Location = New-Object System.Drawing.Point(120, 40)
+    $cmbFiles.Size = New-Object System.Drawing.Size(160, 20)
+    $cmbFiles.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $pnlSettings.Controls.Add($cmbFiles)
+    
     # Resolution Slider (now for a factor)
     $lblFactor = New-Object System.Windows.Forms.Label
     $lblFactor.Text = "Downscale Factor: $($Factor.Value)x"
@@ -283,13 +296,14 @@ function Show-OptionsDialog {
         $script:previewTimer.Stop()
         if ($script:pendingUpdate) {
             $script:pendingUpdate = $false
+            $currentFilePath = $script:inputFiles[$cmbFiles.SelectedIndex]
             $currentFactor = $trkFactor.Value / 100.0
             $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
             $currentFilter = $cmbFilter.SelectedItem
             if ($currentPath -eq "FirstRecolor") {
                 $currentFilter = "Point"
             }
-            Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
+            Update-Preview -inputImagePath $currentFilePath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
         }
     })
 
@@ -301,34 +315,58 @@ function Show-OptionsDialog {
         $script:previewTimer.Stop()
         $script:previewTimer.Start()
     })
-    
-    $cmbFilter.Add_SelectedValueChanged({
-        $Filter.Value = $cmbFilter.SelectedItem
+
+    # Event handler for the new file selection dropdown
+    $cmbFiles.Add_SelectedValueChanged({
+        $selectedFilePath = $script:inputFiles[$cmbFiles.SelectedIndex]
         $currentFactor = $trkFactor.Value / 100.0
         $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
-        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $cmbFilter.SelectedItem -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
+        $currentFilter = $cmbFilter.SelectedItem
+        if ($currentPath -eq "FirstRecolor") {
+            $currentFilter = "Point"
+        }
+        Update-Preview -inputImagePath $selectedFilePath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
+    })
+
+    $cmbFilter.Add_SelectedValueChanged({
+        $Filter.Value = $cmbFilter.SelectedItem
+        $currentFilePath = $script:inputFiles[0]
+        if ($script:inputFiles.Count -gt 1) {
+            $currentFilePath = $script:inputFiles[$cmbFiles.SelectedIndex]
+        }
+        $currentFactor = $trkFactor.Value / 100.0
+        $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
+        Update-Preview -inputImagePath $currentFilePath -factor $currentFactor -filter $cmbFilter.SelectedItem -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
     })
     
     $cmbPalette.Add_SelectedValueChanged({
         $Palette.Value = $cmbPalette.SelectedItem
+        $currentFilePath = $script:inputFiles[0]
+        if ($script:inputFiles.Count -gt 1) {
+            $currentFilePath = $script:inputFiles[$cmbFiles.SelectedIndex]
+        }
         $currentFactor = $trkFactor.Value / 100.0
         $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
         $currentFilter = $cmbFilter.SelectedItem
         if ($currentPath -eq "FirstRecolor") {
             $currentFilter = "Point"
         }
-        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
+        Update-Preview -inputImagePath $currentFilePath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
     })
     
     $cmbDither.Add_SelectedValueChanged({
         $DitherMethod.Value = $cmbDither.SelectedItem
+        $currentFilePath = $script:inputFiles[0]
+        if ($script:inputFiles.Count -gt 1) {
+            $currentFilePath = $script:inputFiles[$cmbFiles.SelectedIndex]
+        }
         $currentFactor = $trkFactor.Value / 100.0
         $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
         $currentFilter = $cmbFilter.SelectedItem
         if ($currentPath -eq "FirstRecolor") {
             $currentFilter = "Point"
         }
-        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
+        Update-Preview -inputImagePath $currentFilePath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
     })
     
     $rbDownscaleFirst.Add_CheckedChanged({
@@ -337,8 +375,12 @@ function Show-OptionsDialog {
         if ($script:lastFilterValue -ne $null) {
             $cmbFilter.SelectedItem = $script:lastFilterValue
         }
+        $currentFilePath = $script:inputFiles[0]
+        if ($script:inputFiles.Count -gt 1) {
+            $currentFilePath = $script:inputFiles[$cmbFiles.SelectedIndex]
+        }
         $currentFactor = $trkFactor.Value / 100.0
-        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $cmbFilter.SelectedItem -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath "FirstDownscale"
+        Update-Preview -inputImagePath $currentFilePath -factor $currentFactor -filter $cmbFilter.SelectedItem -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath "FirstDownscale"
     })
     
     $rbRecolorFirst.Add_CheckedChanged({
@@ -346,8 +388,12 @@ function Show-OptionsDialog {
         $script:lastFilterValue = $cmbFilter.SelectedItem
         $cmbFilter.Enabled = $false
         $cmbFilter.SelectedItem = "Point"
+        $currentFilePath = $script:inputFiles[0]
+        if ($script:inputFiles.Count -gt 1) {
+            $currentFilePath = $script:inputFiles[$cmbFiles.SelectedIndex]
+        }
         $currentFactor = $trkFactor.Value / 100.0
-        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter "Point" -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath "FirstRecolor"
+        Update-Preview -inputImagePath $currentFilePath -factor $currentFactor -filter "Point" -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath "FirstRecolor"
     })
 
     # Initial UI state setup
@@ -359,7 +405,9 @@ function Show-OptionsDialog {
     # If in batch mode, update UI elements
     if ($script:inputFiles.Count -gt 1) {
         $lblBatchMode.Visible = $true
-        $lblIntro.Location = New-Object System.Drawing.Point(10, 40)
+        $lblIntro.Visible = $false
+        $lblFileSelect.Location = New-Object System.Drawing.Point(10, 40)
+        $cmbFiles.Location = New-Object System.Drawing.Point(120, 40)
         $lblFactor.Location = New-Object System.Drawing.Point(10, 70)
         $trkFactor.Location = New-Object System.Drawing.Point(10, 90)
         $lblFilter.Location = New-Object System.Drawing.Point(10, 140)
@@ -370,17 +418,31 @@ function Show-OptionsDialog {
         $cmbDither.Location = New-Object System.Drawing.Point(120, 200)
         $pnlPath.Location = New-Object System.Drawing.Point(10, 230)
         $btnSave.Text = "Save Batch"
+
+        # Populate the combo box for file selection
+        $fileNames = $script:inputFiles | ForEach-Object { [System.IO.Path]::GetFileName($_) }
+        $cmbFiles.Items.AddRange($fileNames)
+        $cmbFiles.SelectedIndex = 0
+        $lblFileSelect.Visible = $true
+        $cmbFiles.Visible = $true
+    } else {
+        $lblFileSelect.Visible = $false
+        $cmbFiles.Visible = $false
     }
 
     # Initial preview update when form is shown
     $form.Add_Shown({ 
+        $currentFilePath = $InputPath
+        if ($script:inputFiles.Count -gt 1) {
+            $currentFilePath = $script:inputFiles[$cmbFiles.SelectedIndex]
+        }
         $currentFactor = $trkFactor.Value / 100.0
         $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
         $currentFilter = $cmbFilter.SelectedItem
         if ($currentPath -eq "FirstRecolor") {
             $currentFilter = "Point"
         }
-        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
+        Update-Preview -inputImagePath $currentFilePath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
     })
 
     # Show the dialog and return result
@@ -615,14 +677,22 @@ try {
         $ofd.Multiselect = $true # Allow multiple file selection
         if ($ofd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { exit }
         
-        $script:inputFiles = $ofd.FileNames | ForEach-Object { (Resolve-Path $_).Path }
-        $InputPath = $script:inputFiles[0] # Use the first file for preview
+        $script:inputFiles = @($ofd.FileNames)
+        
+        Write-Host "[DEBUG] Selected $($script:inputFiles.Count) file(s)."
+        
+        # Explicitly take the first file for preview, whether it's one or part of a batch
+        $InputPath = $script:inputFiles[0]
+        Write-Host "[DEBUG] First file for preview is: $InputPath"
 
         try {
+            Write-Host "[DEBUG] Attempting to load image from path: $InputPath"
             $InputImage = [System.Drawing.Image]::FromFile($InputPath)
+            Write-Host "[DEBUG] Successfully loaded image."
         }
         catch {
-            [System.Windows.Forms.MessageBox]::Show("Failed to load the selected image file.","Error",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
+            Write-Error "Failed to load the selected image file. Full Error: $($_.Exception.Message)"
+            [System.Windows.Forms.MessageBox]::Show("Failed to load the selected image file. See the console for more details.","Error",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
             exit
         }
 
