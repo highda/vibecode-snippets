@@ -82,7 +82,7 @@ function Show-OptionsDialog {
     $cmbPalette = New-Object System.Windows.Forms.ComboBox
     $cmbPalette.Location = New-Object System.Drawing.Point(120, 110)
     $cmbPalette.Size = New-Object System.Drawing.Size(100, 20)
-    $cmbPalette.Items.AddRange(@("LowIntensity", "HighIntensity"))
+    $cmbPalette.Items.AddRange(@("LowIntensity", "HighIntensity","RedCGA","CGA16Color"))
     $cmbPalette.SelectedItem = $Palette.Value
     $pnlSettings.Controls.Add($cmbPalette)
 
@@ -240,8 +240,8 @@ function Convert-Image {
             $script:previewPaletteFile = [System.IO.Path]::GetTempFileName() + ".txt"
         }
         
-        $paletteContent = switch ($Palette) {
-            "LowIntensity"  {
+$paletteContent = switch ($Palette) {
+    "LowIntensity"  {
 @"
 # ImageMagick pixel enumeration: 4,1,255,srgb
 0,0: (0,0,0)      #000000
@@ -249,8 +249,8 @@ function Convert-Image {
 2,0: (170,68,170) #AA44AA
 3,0: (255,255,255)#FFFFFF
 "@
-            }
-            "HighIntensity" {
+    }
+    "HighIntensity" {
 @"
 # ImageMagick pixel enumeration: 4,1,255,srgb
 0,0: (0,0,0)      #000000
@@ -258,8 +258,38 @@ function Convert-Image {
 2,0: (255,85,255) #FF55FF
 3,0: (255,255,255)#FFFFFF
 "@
-            }
-            default {
+    }
+    "RedCGA" {
+@"
+# ImageMagick pixel enumeration: 4,1,255,srgb
+0,0: (0,0,0)      #000000
+1,0: (170,0,0)    #AA0000
+2,0: (170,85,0)   #AA5500
+3,0: (255,255,255)#FFFFFF
+"@
+    }
+    "CGA16Color" {
+@"
+# ImageMagick pixel enumeration: 16,1,255,srgb
+0,0:  (0,0,0)       #000000
+1,0:  (0,0,170)     #0000AA
+2,0:  (0,170,0)     #00AA00
+3,0:  (0,170,170)   #00AAAA
+4,0:  (170,0,0)     #AA0000
+5,0:  (170,0,170)   #AA00AA
+6,0:  (170,85,0)    #AA5500
+7,0:  (170,170,170) #AAAAAA
+8,0:  (85,85,85)    #555555
+9,0:  (85,85,255)   #5555FF
+10,0: (85,255,85)   #55FF55
+11,0: (85,255,255)  #55FFFF
+12,0: (255,85,85)   #FF5555
+13,0: (255,85,255)  #FF55FF
+14,0: (255,255,85)  #FFFF55
+15,0: (255,255,255) #FFFFFF
+"@
+    }
+    default {
 @"
 # ImageMagick pixel enumeration: 4,1,255,srgb
 0,0: (0,0,0)      #000000
@@ -267,8 +297,8 @@ function Convert-Image {
 2,0: (255,85,255) #FF55FF
 3,0: (255,255,255)#FFFFFF
 "@
-            }
-        }
+    }
+}
         Set-Content -Path $script:previewPaletteFile -Value $paletteContent -Encoding ASCII
         
         $imgInfo = & $magickPath identify -format "%w %h" "$InputPath" 2>&1
