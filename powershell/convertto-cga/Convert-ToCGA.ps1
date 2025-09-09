@@ -2,7 +2,7 @@
 param(
     [string]$Input,
     [string]$Output,
-    [int]$Width = 320,
+    [int]$Width = 64,
     [string]$Palette = "HighIntensity",
     [string]$DitherMethod = "FloydSteinberg"
 )
@@ -66,7 +66,7 @@ function Show-OptionsDialog {
     $trkWidth = New-Object System.Windows.Forms.TrackBar
     $trkWidth.Location = New-Object System.Drawing.Point(10, 60)
     $trkWidth.Size = New-Object System.Drawing.Size(280, 45)
-    $trkWidth.Minimum = 320
+    $trkWidth.Minimum = 64
     $trkWidth.Maximum = $InputImage.Width
     $trkWidth.Value = $Width.Value
     $trkWidth.TickFrequency = 160
@@ -109,47 +109,79 @@ function Show-OptionsDialog {
     $form.Controls.Add($picPreview)
 
     # Function to update the preview (defined inside the dialog scope)
-    function Update-Preview {
-        param (
-            [string]$inputImagePath,
-            [int]$width,
-            [string]$palette,
-            [string]$ditherMethod
-        )
-        try {
-            if ([string]::IsNullOrEmpty($inputImagePath)) {
-                Write-Error "Input image path is null or empty. Cannot update preview."
-                return
-            }
-
-            if (-not (Test-Path $inputImagePath)) {
-                Write-Error "Input image path does not exist: $inputImagePath"
-                return
-            }
-
-            # Use the single, persistent temp file
-            Convert-Image -InputPath $inputImagePath -OutputPath $script:previewTempFile -Width $width -Palette $palette -DitherMethod $ditherMethod -Silent
-            
-            if (Test-Path $script:previewTempFile) {
-                # Dispose of previous image if it exists
-                if ($picPreview.Image -ne $null) {
-                    $picPreview.Image.Dispose()
-                }
-                
-                # Load image from file stream to avoid locking
-                $stream = [System.IO.FileStream]::new($script:previewTempFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
-                $previewBitmap = [System.Drawing.Bitmap]::new($stream)
-                $stream.Close()
-                
-                $picPreview.Image = $previewBitmap
-            } else {
-                Write-Error "Temporary output file not found. Conversion might have failed."
-            }
+ function Update-Preview {
+    param (
+        [string]$inputImagePath,
+        [int]$width,
+        [string]$palette,
+        [string]$ditherMethod
+    )
+    try {
+        if ([string]::IsNullOrEmpty($inputImagePath)) {
+            Write-Error "Input image path is null or empty. Cannot update preview."
+            return
         }
-        catch {
-            Write-Error "Error in Update-Preview: $($_.Exception.Message)"
+
+        if (-not (Test-Path $inputImagePath)) {
+            Write-Error "Input image path does not exist: $inputImagePath"
+            return
+        }
+
+        # Use the single, persistent temp file
+        Convert-Image -InputPath $inputImagePath -OutputPath $script:previewTempFile -Width $width -Palette $palette -DitherMethod $ditherMethod -Silent
+
+        if (Test-Path $script:previewTempFile) {
+            # Dispose of previous image and graphic objects
+            if ($picPreview.Image -ne $null) {
+                $picPreview.Image.Dispose()
+                $picPreview.Image = $null
+            }
+
+            # Load image from file stream to avoid locking
+            $stream = [System.IO.FileStream]::new($script:previewTempFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+            $sourceBitmap = [System.Drawing.Bitmap]::new($stream)
+            $stream.Close()
+
+            # Create a new Bitmap to hold the pixelated preview
+            $scaledBitmap = New-Object System.Drawing.Bitmap($picPreview.Width, $picPreview.Height)
+            $graphics = [System.Drawing.Graphics]::FromImage($scaledBitmap)
+
+            # Set the interpolation mode to NearestNeighbor for pixelated scaling
+            $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
+            # Set the pixel offset mode for high-quality, non-smoothed rendering
+            $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+
+            # Calculate the destination rectangle to maintain aspect ratio without smoothing
+            $picWidth = $picPreview.Width
+            $picHeight = $picPreview.Height
+            $imgWidth = $sourceBitmap.Width
+            $imgHeight = $sourceBitmap.Height
+
+            $scaleX = $picWidth / $imgWidth
+            $scaleY = $picHeight / $imgHeight
+            $scale = [math]::Min($scaleX, $scaleY)
+
+            $destWidth = [math]::Round($imgWidth * $scale)
+            $destHeight = [math]::Round($imgHeight * $scale)
+            $destX = ($picWidth - $destWidth) / 2
+            $destY = ($picHeight - $destHeight) / 2
+            
+            # Draw the image with pixelated scaling
+            $graphics.DrawImage($sourceBitmap, $destX, $destY, $destWidth, $destHeight)
+
+            $picPreview.Image = $scaledBitmap
+            
+            # Dispose of the source bitmap and graphics object
+            $sourceBitmap.Dispose()
+            $graphics.Dispose()
+        } else {
+            Write-Error "Temporary output file not found. Conversion might have failed."
         }
     }
+    catch {
+        Write-Error "Error in Update-Preview: $($_.Exception.Message)"
+    }
+}
 
     # Debounce Timer for the slider
     $script:previewTimer = New-Object System.Windows.Forms.Timer
