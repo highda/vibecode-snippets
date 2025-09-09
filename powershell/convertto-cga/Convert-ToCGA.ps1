@@ -1,20 +1,25 @@
 [CmdletBinding()]
 param(
+    [switch]$Help,
     [string]$Input,
     [string]$Output,
-    [int]$Width = 64,
+    [double]$Factor = 0.5,
     [string]$Palette = "HighIntensity",
-    [string]$DitherMethod = "FloydSteinberg"
+    [string]$DitherMethod = "FloydSteinberg",
+    [string]$Filter = "Point",
+    [string]$ProcessingPath = "FirstDownscale"
 )
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# --- Script-scoped variables for persistent temp files and debouncing timer ---
+# --- Script-scoped variables for persistent temp files, debouncing timer, and UI state ---
 $script:previewTempFile = $null
 $script:previewPaletteFile = $null
 $script:previewTimer = $null
 $script:pendingUpdate = $false
+$script:lastFilterValue = $Filter
+$script:inputFiles = @() # New variable to store multiple file paths
 
 # Define the full path to the magick.exe executable
 $magickPath = Join-Path -Path $PSScriptRoot -ChildPath "magick.exe"
@@ -26,11 +31,51 @@ if (-not (Test-Path -Path $magickPath -PathType Leaf)) {
     exit
 }
 
+function Show-Help {
+    Write-Host "CGA Image Converter Script"
+    Write-Host "--------------------------`n"
+    Write-Host "This script converts an image to a CGA-style palette."
+    Write-Host "It can be run with a graphical user interface (GUI) or from the command line (CLI).`n"
+    Write-Host "Usage:`n"
+    Write-Host "  GUI Mode (no parameters):`n"
+    Write-Host "    $($PSCommandPath)`n"
+    Write-Host "  CLI Mode (with parameters):`n"
+    Write-Host "    $($PSCommandPath) -Input <path> -Output <path> [options]`n"
+    Write-Host "  Help:`n"
+    Write-Host "    $($PSCommandPath) -Help`n"
+    Write-Host "Parameters:`n"
+    Write-Host "  -Input <string>"
+    Write-Host "    Path to the source image file (required in CLI mode)."
+    Write-Host "  -Output <string>"
+    Write-Host "    Path for the converted image file (required in CLI mode)."
+    Write-Host "  -Factor <double>"
+    Write-Host "    Downscale factor. Value is between 0.01 and 1.0 (default: 0.5)."
+    Write-Host "  -Palette <string>"
+    Write-Host "    The color palette to use (default: HighIntensity)."
+    Write-Host "    Options: LowIntensity, HighIntensity, RedCGA, CGA16Color"
+    Write-Host "  -DitherMethod <string>"
+    Write-Host "    The dithering algorithm to use (default: FloydSteinberg)."
+    Write-Host "    Options: None, FloydSteinberg, Riemersma, Jarvis, Stucki"
+    Write-Host "  -Filter <string>"
+    Write-Host "    The filter to use for downscaling (default: Point)."
+    Write-Host "    Note: The filter is automatically set to 'Point' when ProcessingPath is 'FirstRecolor'."
+    Write-Host "    Options: Point, Bartlett, Blackman, Bohman, Box, Catrom, Cubic, Gaussian, Hamming, Hanning, Hermite, Jinc, Kaiser, Lagrange, Lanczos, LanczosSharp, Lanczos2, Lanczos2Sharp, Mitchell, Parzen, Quadratic, Robidoux, Sinc, SincFast, Triangle, Welsh"
+    Write-Host "  -ProcessingPath <string>"
+    Write-Host "    The order of processing steps (default: FirstDownscale)."
+    Write-Host "    Options: FirstDownscale (Downscale -> Recolor -> Upscale)"
+    Write-Host "             FirstRecolor (Recolor -> Downscale -> Upscale)"
+    Write-Host "`nExamples:`n"
+    Write-Host "  $($PSCommandPath) -Input image.png -Output converted.png -Factor 0.25 -Palette RedCGA"
+    Write-Host "  $($PSCommandPath) -Input photo.jpg -Output converted.png -DitherMethod Stucki -ProcessingPath FirstRecolor"
+}
+
 function Show-OptionsDialog {
     param(
-        [ref]$Width,
+        [ref]$Factor,
         [ref]$Palette,
         [ref]$DitherMethod,
+        [ref]$Filter,
+        [ref]$ProcessingPath,
         [string]$InputPath,
         [System.Drawing.Image]$InputImage
     )
@@ -50,37 +95,66 @@ function Show-OptionsDialog {
     $pnlSettings.BackColor = [System.Drawing.Color]::LightGray
     $form.Controls.Add($pnlSettings)
 
+    # UI for batch mode
+    $lblBatchMode = New-Object System.Windows.Forms.Label
+    $lblBatchMode.Text = "Batch Mode"
+    $lblBatchMode.Font = New-Object System.Drawing.Font("Arial", 12, [System.Drawing.FontStyle]::Bold)
+    $lblBatchMode.Location = New-Object System.Drawing.Point(10, 10)
+    $lblBatchMode.AutoSize = $true
+    $lblBatchMode.ForeColor = [System.Drawing.Color]::DarkRed
+    $pnlSettings.Controls.Add($lblBatchMode)
+    $lblBatchMode.Visible = $false
+    
     $lblIntro = New-Object System.Windows.Forms.Label
     $lblIntro.Text = "Select conversion parameters:"
-    $lblIntro.Location = New-Object System.Drawing.Point(10, 10)
+    $lblIntro.Location = New-Object System.Drawing.Point(10, 40)
     $lblIntro.Size = New-Object System.Drawing.Size(280, 20)
     $pnlSettings.Controls.Add($lblIntro)
 
-    # Resolution Slider
-    $lblWidth = New-Object System.Windows.Forms.Label
-    $lblWidth.Text = "Resolution: $($Width.Value) px"
-    $lblWidth.Location = New-Object System.Drawing.Point(10, 40)
-    $lblWidth.Size = New-Object System.Drawing.Size(280, 20)
-    $pnlSettings.Controls.Add($lblWidth)
+    # Resolution Slider (now for a factor)
+    $lblFactor = New-Object System.Windows.Forms.Label
+    $lblFactor.Text = "Downscale Factor: $($Factor.Value)x"
+    $lblFactor.Location = New-Object System.Drawing.Point(10, 70)
+    $lblFactor.Size = New-Object System.Drawing.Size(280, 20)
+    $pnlSettings.Controls.Add($lblFactor)
 
-    $trkWidth = New-Object System.Windows.Forms.TrackBar
-    $trkWidth.Location = New-Object System.Drawing.Point(10, 60)
-    $trkWidth.Size = New-Object System.Drawing.Size(280, 45)
-    $trkWidth.Minimum = 64
-    $trkWidth.Maximum = $InputImage.Width
-    $trkWidth.Value = $Width.Value
-    $trkWidth.TickFrequency = 160
-    $pnlSettings.Controls.Add($trkWidth)
+    $trkFactor = New-Object System.Windows.Forms.TrackBar
+    $trkFactor.Location = New-Object System.Drawing.Point(10, 90)
+    $trkFactor.Size = New-Object System.Drawing.Size(280, 45)
+    $trkFactor.Minimum = 1
+    $trkFactor.Maximum = 100
+    $trkFactor.Value = [math]::Round($Factor.Value * 100)
+    $pnlSettings.Controls.Add($trkFactor)
+    
+    # Filter Dropdown
+    $lblFilter = New-Object System.Windows.Forms.Label
+    $lblFilter.Text = "Downscale Filter:"
+    $lblFilter.Location = New-Object System.Drawing.Point(10, 140)
+    $lblFilter.Size = New-Object System.Drawing.Size(100, 20)
+    $pnlSettings.Controls.Add($lblFilter)
+    
+    $cmbFilter = New-Object System.Windows.Forms.ComboBox
+    $cmbFilter.Location = New-Object System.Drawing.Point(120, 140)
+    $cmbFilter.Size = New-Object System.Drawing.Size(120, 20)
+    $cmbFilter.Items.AddRange(@(
+        "Point", "Bartlett", "Blackman", "Bohman", "Box", "Catrom", "Cubic",
+        "Gaussian", "Hamming", "Hanning", "Hermite", "Jinc", "Kaiser",
+        "Lagrange", "Lanczos", "LanczosSharp", "Lanczos2",
+        "Lanczos2Sharp", "Mitchell", "Parzen", "Quadratic",
+        "Robidoux", "Sinc", "SincFast", "Triangle", "Welsh"
+    ))
+    $cmbFilter.SelectedItem = $Filter.Value
+    $pnlSettings.Controls.Add($cmbFilter)
 
     # Palette Dropdown
     $lblPalette = New-Object System.Windows.Forms.Label
     $lblPalette.Text = "Palette:"
-    $lblPalette.Location = New-Object System.Drawing.Point(10, 110)
+    $lblPalette.Location = New-Object System.Drawing.Point(10, 170)
     $lblPalette.Size = New-Object System.Drawing.Size(100, 20)
     $pnlSettings.Controls.Add($lblPalette)
 
     $cmbPalette = New-Object System.Windows.Forms.ComboBox
-    $cmbPalette.Location = New-Object System.Drawing.Point(120, 110)
+    $cmbPalette.Location = New-Object System.Drawing.Point(120, 170)
     $cmbPalette.Size = New-Object System.Drawing.Size(100, 20)
     $cmbPalette.Items.AddRange(@("LowIntensity", "HighIntensity","RedCGA","CGA16Color"))
     $cmbPalette.SelectedItem = $Palette.Value
@@ -89,17 +163,55 @@ function Show-OptionsDialog {
     # Dithering Dropdown
     $lblDither = New-Object System.Windows.Forms.Label
     $lblDither.Text = "Dithering:"
-    $lblDither.Location = New-Object System.Drawing.Point(10, 140)
+    $lblDither.Location = New-Object System.Drawing.Point(10, 200)
     $lblDither.Size = New-Object System.Drawing.Size(100, 20)
     $pnlSettings.Controls.Add($lblDither)
 
     $cmbDither = New-Object System.Windows.Forms.ComboBox
-    $cmbDither.Location = New-Object System.Drawing.Point(120, 140)
+    $cmbDither.Location = New-Object System.Drawing.Point(120, 200)
     $cmbDither.Size = New-Object System.Drawing.Size(120, 20)
-    $cmbDither.Items.AddRange(@("None", "FloydSteinberg", "Riemersma"))
+    $cmbDither.Items.AddRange(@("None", "FloydSteinberg", "Riemersma", "Jarvis", "Stucki"))
     $cmbDither.SelectedItem = $DitherMethod.Value
     $pnlSettings.Controls.Add($cmbDither)
 
+    # Processing Path Radio Buttons
+    $pnlPath = New-Object System.Windows.Forms.GroupBox
+    $pnlPath.Text = "Processing Path"
+    $pnlPath.Location = New-Object System.Drawing.Point(10, 230)
+    $pnlPath.Size = New-Object System.Drawing.Size(280, 60)
+    $pnlSettings.Controls.Add($pnlPath)
+    
+    $rbDownscaleFirst = New-Object System.Windows.Forms.RadioButton
+    $rbDownscaleFirst.Text = "First downscale"
+    $rbDownscaleFirst.Location = New-Object System.Drawing.Point(10, 20)
+    $pnlPath.Controls.Add($rbDownscaleFirst)
+    
+    $rbRecolorFirst = New-Object System.Windows.Forms.RadioButton
+    $rbRecolorFirst.Text = "First recolor"
+    $rbRecolorFirst.Location = New-Object System.Drawing.Point(130, 20)
+    $pnlPath.Controls.Add($rbRecolorFirst)
+    
+    if ($ProcessingPath.Value -eq "FirstDownscale") {
+        $rbDownscaleFirst.Checked = $true
+    } else {
+        $rbRecolorFirst.Checked = $true
+    }
+
+    # Action Buttons
+    $btnSave = New-Object System.Windows.Forms.Button
+    $btnSave.Text = "Save Image"
+    $btnSave.Location = New-Object System.Drawing.Point(10, 300)
+    $btnSave.Size = New-Object System.Drawing.Size(130, 30)
+    $btnSave.Add_Click({ $form.DialogResult = [System.Windows.Forms.DialogResult]::OK; $form.Close() })
+    $pnlSettings.Controls.Add($btnSave)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Location = New-Object System.Drawing.Point(150, 300)
+    $btnCancel.Size = New-Object System.Drawing.Size(130, 30)
+    $btnCancel.Add_Click({ $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; $form.Close() })
+    $pnlSettings.Controls.Add($btnCancel)
+    
     # Preview Image Box
     $picPreview = New-Object System.Windows.Forms.PictureBox
     $picPreview.Location = New-Object System.Drawing.Point(320, 10)
@@ -108,80 +220,61 @@ function Show-OptionsDialog {
     $picPreview.BorderStyle = "FixedSingle"
     $form.Controls.Add($picPreview)
 
-    # Function to update the preview (defined inside the dialog scope)
- function Update-Preview {
-    param (
-        [string]$inputImagePath,
-        [int]$width,
-        [string]$palette,
-        [string]$ditherMethod
-    )
-    try {
-        if ([string]::IsNullOrEmpty($inputImagePath)) {
-            Write-Error "Input image path is null or empty. Cannot update preview."
-            return
-        }
+    function Update-Preview {
+        param (
+            [string]$inputImagePath,
+            [double]$factor,
+            [string]$filter,
+            [string]$palette,
+            [string]$ditherMethod,
+            [string]$processingPath
+        )
+        try {
+            if ([string]::IsNullOrEmpty($inputImagePath)) { return }
+            if (-not (Test-Path $inputImagePath)) { return }
+            
+            Convert-Image -InputPath $inputImagePath -OutputPath $script:previewTempFile -Factor $factor -Palette $palette -DitherMethod $ditherMethod -Filter $filter -ProcessingPath $processingPath -Silent
 
-        if (-not (Test-Path $inputImagePath)) {
-            Write-Error "Input image path does not exist: $inputImagePath"
-            return
-        }
+            if (Test-Path $script:previewTempFile) {
+                if ($picPreview.Image -ne $null) { $picPreview.Image.Dispose() }
+                
+                $stream = [System.IO.FileStream]::new($script:previewTempFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+                $sourceBitmap = [System.Drawing.Bitmap]::new($stream)
+                $stream.Close()
 
-        # Use the single, persistent temp file
-        Convert-Image -InputPath $inputImagePath -OutputPath $script:previewTempFile -Width $width -Palette $palette -DitherMethod $ditherMethod -Silent
+                $scaledBitmap = New-Object System.Drawing.Bitmap($picPreview.Width, $picPreview.Height)
+                $graphics = [System.Drawing.Graphics]::FromImage($scaledBitmap)
+                $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
+                $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
 
-        if (Test-Path $script:previewTempFile) {
-            # Dispose of previous image and graphic objects
-            if ($picPreview.Image -ne $null) {
-                $picPreview.Image.Dispose()
-                $picPreview.Image = $null
+                $picWidth = $picPreview.Width
+                $picHeight = $picPreview.Height
+                $imgWidth = $sourceBitmap.Width
+                $imgHeight = $sourceBitmap.Height
+
+                $scaleX = $picWidth / $imgWidth
+                $scaleY = $picHeight / $imgHeight
+                $scale = [math]::Min($scaleX, $scaleY)
+
+                $destWidth = [math]::Round($imgWidth * $scale)
+                $destHeight = [math]::Round($imgHeight * $scale)
+                $destX = ($picWidth - $destWidth) / 2
+                $destY = ($picHeight - $destHeight) / 2
+                
+                $graphics.DrawImage($sourceBitmap, $destX, $destY, $destWidth, $destHeight)
+
+                $picPreview.Image = $scaledBitmap
+                
+                $sourceBitmap.Dispose()
+                $graphics.Dispose()
+            } else {
+                Write-Error "Temporary output file not found. Conversion might have failed."
             }
-
-            # Load image from file stream to avoid locking
-            $stream = [System.IO.FileStream]::new($script:previewTempFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
-            $sourceBitmap = [System.Drawing.Bitmap]::new($stream)
-            $stream.Close()
-
-            # Create a new Bitmap to hold the pixelated preview
-            $scaledBitmap = New-Object System.Drawing.Bitmap($picPreview.Width, $picPreview.Height)
-            $graphics = [System.Drawing.Graphics]::FromImage($scaledBitmap)
-
-            # Set the interpolation mode to NearestNeighbor for pixelated scaling
-            $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
-            # Set the pixel offset mode for high-quality, non-smoothed rendering
-            $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-
-            # Calculate the destination rectangle to maintain aspect ratio without smoothing
-            $picWidth = $picPreview.Width
-            $picHeight = $picPreview.Height
-            $imgWidth = $sourceBitmap.Width
-            $imgHeight = $sourceBitmap.Height
-
-            $scaleX = $picWidth / $imgWidth
-            $scaleY = $picHeight / $imgHeight
-            $scale = [math]::Min($scaleX, $scaleY)
-
-            $destWidth = [math]::Round($imgWidth * $scale)
-            $destHeight = [math]::Round($imgHeight * $scale)
-            $destX = ($picWidth - $destWidth) / 2
-            $destY = ($picHeight - $destHeight) / 2
-            
-            # Draw the image with pixelated scaling
-            $graphics.DrawImage($sourceBitmap, $destX, $destY, $destWidth, $destHeight)
-
-            $picPreview.Image = $scaledBitmap
-            
-            # Dispose of the source bitmap and graphics object
-            $sourceBitmap.Dispose()
-            $graphics.Dispose()
-        } else {
-            Write-Error "Temporary output file not found. Conversion might have failed."
+        }
+        catch {
+            Write-Error "Error in Update-Preview: $($_.Exception.Message)"
         }
     }
-    catch {
-        Write-Error "Error in Update-Preview: $($_.Exception.Message)"
-    }
-}
 
     # Debounce Timer for the slider
     $script:previewTimer = New-Object System.Windows.Forms.Timer
@@ -190,66 +283,121 @@ function Show-OptionsDialog {
         $script:previewTimer.Stop()
         if ($script:pendingUpdate) {
             $script:pendingUpdate = $false
-            Update-Preview -inputImagePath $InputPath -width $trkWidth.Value -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem
+            $currentFactor = $trkFactor.Value / 100.0
+            $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
+            $currentFilter = $cmbFilter.SelectedItem
+            if ($currentPath -eq "FirstRecolor") {
+                $currentFilter = "Point"
+            }
+            Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
         }
     })
 
-    # Event handlers with proper variable access
-    $trkWidth.Add_ValueChanged({
-        $Width.Value = $trkWidth.Value
-        $lblWidth.Text = "Resolution: $($Width.Value) px"
+    # Event handlers
+    $trkFactor.Add_ValueChanged({
+        $Factor.Value = $trkFactor.Value / 100.0
+        $lblFactor.Text = "Downscale Factor: $($Factor.Value)x"
         $script:pendingUpdate = $true
         $script:previewTimer.Stop()
         $script:previewTimer.Start()
     })
-
+    
+    $cmbFilter.Add_SelectedValueChanged({
+        $Filter.Value = $cmbFilter.SelectedItem
+        $currentFactor = $trkFactor.Value / 100.0
+        $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
+        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $cmbFilter.SelectedItem -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
+    })
+    
     $cmbPalette.Add_SelectedValueChanged({
         $Palette.Value = $cmbPalette.SelectedItem
-        Update-Preview -inputImagePath $InputPath -width $trkWidth.Value -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem
+        $currentFactor = $trkFactor.Value / 100.0
+        $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
+        $currentFilter = $cmbFilter.SelectedItem
+        if ($currentPath -eq "FirstRecolor") {
+            $currentFilter = "Point"
+        }
+        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
     })
     
     $cmbDither.Add_SelectedValueChanged({
         $DitherMethod.Value = $cmbDither.SelectedItem
-        Update-Preview -inputImagePath $InputPath -width $trkWidth.Value -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem
+        $currentFactor = $trkFactor.Value / 100.0
+        $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
+        $currentFilter = $cmbFilter.SelectedItem
+        if ($currentPath -eq "FirstRecolor") {
+            $currentFilter = "Point"
+        }
+        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
+    })
+    
+    $rbDownscaleFirst.Add_CheckedChanged({
+        $ProcessingPath.Value = "FirstDownscale"
+        $cmbFilter.Enabled = $true
+        if ($script:lastFilterValue -ne $null) {
+            $cmbFilter.SelectedItem = $script:lastFilterValue
+        }
+        $currentFactor = $trkFactor.Value / 100.0
+        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $cmbFilter.SelectedItem -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath "FirstDownscale"
+    })
+    
+    $rbRecolorFirst.Add_CheckedChanged({
+        $ProcessingPath.Value = "FirstRecolor"
+        $script:lastFilterValue = $cmbFilter.SelectedItem
+        $cmbFilter.Enabled = $false
+        $cmbFilter.SelectedItem = "Point"
+        $currentFactor = $trkFactor.Value / 100.0
+        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter "Point" -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath "FirstRecolor"
     })
 
-    # Action Buttons
-    $btnSave = New-Object System.Windows.Forms.Button
-    $btnSave.Text = "Save Image"
-    $btnSave.Location = New-Object System.Drawing.Point(10, 180)
-    $btnSave.Size = New-Object System.Drawing.Size(130, 30)
-    $btnSave.Add_Click({ $form.DialogResult = [System.Windows.Forms.DialogResult]::OK; $form.Close() })
-    $pnlSettings.Controls.Add($btnSave)
+    # Initial UI state setup
+    if ($ProcessingPath.Value -eq "FirstRecolor") {
+        $cmbFilter.Enabled = $false
+        $cmbFilter.SelectedItem = "Point"
+    }
 
-    $btnCancel = New-Object System.Windows.Forms.Button
-    $btnCancel.Text = "Cancel"
-    $btnCancel.Location = New-Object System.Drawing.Point(150, 180)
-    $btnCancel.Size = New-Object System.Drawing.Size(130, 30)
-    $btnCancel.Add_Click({ $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; $form.Close() })
-    $pnlSettings.Controls.Add($btnCancel)
-    
+    # If in batch mode, update UI elements
+    if ($script:inputFiles.Count -gt 1) {
+        $lblBatchMode.Visible = $true
+        $lblIntro.Location = New-Object System.Drawing.Point(10, 40)
+        $lblFactor.Location = New-Object System.Drawing.Point(10, 70)
+        $trkFactor.Location = New-Object System.Drawing.Point(10, 90)
+        $lblFilter.Location = New-Object System.Drawing.Point(10, 140)
+        $cmbFilter.Location = New-Object System.Drawing.Point(120, 140)
+        $lblPalette.Location = New-Object System.Drawing.Point(10, 170)
+        $cmbPalette.Location = New-Object System.Drawing.Point(120, 170)
+        $lblDither.Location = New-Object System.Drawing.Point(10, 200)
+        $cmbDither.Location = New-Object System.Drawing.Point(120, 200)
+        $pnlPath.Location = New-Object System.Drawing.Point(10, 230)
+        $btnSave.Text = "Save Batch"
+    }
+
     # Initial preview update when form is shown
     $form.Add_Shown({ 
-        Update-Preview -inputImagePath $InputPath -width $trkWidth.Value -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem
+        $currentFactor = $trkFactor.Value / 100.0
+        $currentPath = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
+        $currentFilter = $cmbFilter.SelectedItem
+        if ($currentPath -eq "FirstRecolor") {
+            $currentFilter = "Point"
+        }
+        Update-Preview -inputImagePath $InputPath -factor $currentFactor -filter $currentFilter -palette $cmbPalette.SelectedItem -ditherMethod $cmbDither.SelectedItem -processingPath $currentPath
     })
 
     # Show the dialog and return result
     $result = $form.ShowDialog()
     
-    # Dispose of the image in the picture box and the timer
-    if ($picPreview.Image -ne $null) {
-        $picPreview.Image.Dispose()
-    }
-    if ($script:previewTimer -ne $null) {
-        $script:previewTimer.Dispose()
-    }
+    # Dispose of the image and timer
+    if ($picPreview.Image -ne $null) { $picPreview.Image.Dispose() }
+    if ($script:previewTimer -ne $null) { $script:previewTimer.Dispose() }
     
     $form.Dispose()
     
     if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-        $Width.Value = $trkWidth.Value
+        $Factor.Value = $trkFactor.Value / 100.0
         $Palette.Value = $cmbPalette.SelectedItem
         $DitherMethod.Value = $cmbDither.SelectedItem
+        $ProcessingPath.Value = if ($rbDownscaleFirst.Checked) { "FirstDownscale" } else { "FirstRecolor" }
+        $Filter.Value = if ($ProcessingPath.Value -eq "FirstRecolor") { "Point" } else { $cmbFilter.SelectedItem }
         return $true
     } else {
         return $false
@@ -260,14 +408,15 @@ function Convert-Image {
     param(
         [string]$InputPath,
         [string]$OutputPath,
-        [int]$Width,
+        [double]$Factor,
         [string]$Palette,
         [string]$DitherMethod,
+        [string]$Filter,
+        [string]$ProcessingPath,
         [switch]$Silent
     )
     
     try {
-        # Check if the persistent palette file exists, if not, create it
         if ($null -eq $script:previewPaletteFile) {
             $script:previewPaletteFile = [System.IO.Path]::GetTempFileName() + ".txt"
         }
@@ -342,122 +491,195 @@ $paletteContent = switch ($Palette) {
         if ($tokens.Count -lt 2 -or -not ([int]::TryParse($tokens[0], [ref]$origWidth)) -or -not ([int]::TryParse($tokens[1], [ref]$origHeight))) {
             $errorMsg = "Failed to get image dimensions. The file may be invalid or ImageMagick failed to read it. Output: $imgInfo"
             Write-Error $errorMsg
-            if (-not $Silent) {
-                throw $errorMsg
-            }
+            if (-not $Silent) { throw $errorMsg }
             return
         }
 
-        $newHeight = [math]::Round($origHeight * ($Width / $origWidth))
+        $newWidth = [math]::Ceiling($origWidth * $Factor)
+        $newHeight = [math]::Ceiling($origHeight * $Factor)
+        
+        if ($newWidth -lt 1) { $newWidth = 1 }
+        if ($newHeight -lt 1) { $newHeight = 1 }
 
-        # Build the magick arguments incrementally
         $magickArgs = @()
-        $magickArgs += "$InputPath"
-        $magickArgs += "-resize"
-        $magickArgs += "${Width}x${newHeight}!"
-        $magickArgs += "-remap"
-        $magickArgs += "$script:previewPaletteFile"
-        if ($DitherMethod -ne "None") {
-            $magickArgs += "-dither"
-            $magickArgs += $DitherMethod
+        
+        switch ($ProcessingPath) {
+            "FirstRecolor" {
+                $magickArgs += "$InputPath"
+                
+                # First, recolor and dither at the original resolution
+                $magickArgs += "-remap"
+                $magickArgs += "$script:previewPaletteFile"
+                if ($DitherMethod -ne "None") {
+                    $magickArgs += "-dither"
+                    $magickArgs += $DitherMethod
+                }
+                $magickArgs += "-colors"
+                $magickArgs += "4"
+                
+                # Then, downscale and upscale using ONLY the Point filter
+                $magickArgs += "-filter"
+                $magickArgs += "Point"
+                $magickArgs += "-resize"
+                $magickArgs += "${newWidth}x${newHeight}!"
+                
+                $magickArgs += "-filter"
+                $magickArgs += "Point"
+                $magickArgs += "-resize"
+                $magickArgs += "${origWidth}x${origHeight}!"
+                $magickArgs += "$OutputPath"
+            }
+            "FirstDownscale" {
+                # This is the original pipeline
+                $magickArgs += "$InputPath"
+                
+                # 1. Downscale first
+                $magickArgs += "-filter"
+                $magickArgs += "$Filter"
+                $magickArgs += "-resize"
+                $magickArgs += "${newWidth}x${newHeight}!"
+                
+                # 2. Map colors and dither
+                $magickArgs += "-remap"
+                $magickArgs += "$script:previewPaletteFile"
+                if ($DitherMethod -ne "None") {
+                    $magickArgs += "-dither"
+                    $magickArgs += $DitherMethod
+                }
+                $magickArgs += "-colors"
+                $magickArgs += "4"
+                
+                # 3. Upscale to the original dimensions with Point filter
+                $magickArgs += "-filter"
+                $magickArgs += "Point"
+                $magickArgs += "-resize"
+                $magickArgs += "${origWidth}x${origHeight}!"
+                $magickArgs += "$OutputPath"
+            }
+            default {
+                throw "Invalid Processing Path specified."
+            }
         }
-        $magickArgs += "-colors"
-        $magickArgs += "4"
-        $magickArgs += "$OutputPath"
         
         $magickOutput = & $magickPath $magickArgs 2>&1
         
         if ($LASTEXITCODE -ne 0) {
             $errorMsg = "ImageMagick conversion failed with exit code $LASTEXITCODE. Output: $magickOutput"
             Write-Error $errorMsg
-            if (-not $Silent) {
-                throw $errorMsg
-            }
+            if (-not $Silent) { throw $errorMsg }
         }
     }
     catch {
         Write-Error "Exception in Convert-Image: $($_.Exception.Message)"
-        if (-not $Silent) {
-            throw
-        }
+        if (-not $Silent) { throw }
     }
 }
 
-try {
-    
-    # Initialize persistent temp file path outside the function
-    $script:previewTempFile = [System.IO.Path]::GetTempFileName() + ".png"
+# Moved the temp file initialization outside the main try block
+$script:previewTempFile = [System.IO.Path]::GetTempFileName() + ".png"
+$script:previewPaletteFile = [System.IO.Path]::GetTempFileName() + ".txt"
 
-    # Check if the 'Input' parameter was not provided on the command line
-    if (-not $PSCmdlet.MyInvocation.BoundParameters.ContainsKey('Input')) {
+try {
+    if ($Help) {
+        Show-Help
+        exit
+    }
+    
+    # Input validation for CLI mode
+    if ($PSCmdlet.MyInvocation.BoundParameters.ContainsKey('Input')) {
+        if (-not $PSCmdlet.MyInvocation.BoundParameters.ContainsKey('Output')) {
+            throw "The -Output parameter is required in command-line mode."
+        }
+        if (-not (Test-Path $Input)) {
+            throw "Input file does not exist: $Input"
+        }
+        if ($Factor -le 0) {
+            throw "The -Factor must be a positive number."
+        }
+        
+        $finalFilter = $Filter
+        if ($ProcessingPath -eq "FirstRecolor") {
+            $finalFilter = "Point"
+        }
+
+        $InputPath = (Resolve-Path $Input).Path
+        $OutputPath = $Output
+        
+        Convert-Image -InputPath $InputPath -OutputPath $OutputPath -Factor $Factor -Palette $Palette -DitherMethod $DitherMethod -Filter $finalFilter -ProcessingPath $ProcessingPath
+        
+    } else {
         # GUI Mode
         $ofd = New-Object System.Windows.Forms.OpenFileDialog
         $ofd.Filter = "Image Files|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff"
-        $ofd.Title = "Select Input Image"
-        if ($ofd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { 
-            exit 
-        }
+        $ofd.Title = "Select Input Image(s)"
+        $ofd.Multiselect = $true # Allow multiple file selection
+        if ($ofd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { exit }
         
-        $InputPath = (Resolve-Path $ofd.FileName).Path
-        
+        $script:inputFiles = $ofd.FileNames | ForEach-Object { (Resolve-Path $_).Path }
+        $InputPath = $script:inputFiles[0] # Use the first file for preview
+
         try {
             $InputImage = [System.Drawing.Image]::FromFile($InputPath)
         }
         catch {
-            Write-Error "Failed to load input image: $($_.Exception.Message)"
             [System.Windows.Forms.MessageBox]::Show("Failed to load the selected image file.","Error",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
             exit
         }
 
-        $w = [ref]$Width
+        $f = [ref]$Factor
         $p = [ref]$Palette
         $d = [ref]$DitherMethod
+        $l = [ref]$Filter
+        $t = [ref]$ProcessingPath
         
-        if (-not (Show-OptionsDialog -Width $w -Palette $p -DitherMethod $d -InputPath $InputPath -InputImage $InputImage)) { 
+        if (-not (Show-OptionsDialog -Factor $f -Palette $p -DitherMethod $d -Filter $l -ProcessingPath $t -InputPath $InputPath -InputImage $InputImage)) { 
             $InputImage.Dispose()
             exit 
         }
         
-        $Width = $w.Value
+        $Factor = $f.Value
         $Palette = $p.Value
         $DitherMethod = $d.Value
+        $Filter = $l.Value
+        $ProcessingPath = $t.Value
         
-        $sfd = New-Object System.Windows.Forms.SaveFileDialog
-        $sfd.Filter = "PNG Image|*.png"
-        $sfd.Title = "Save Output Image"
-        $sfd.FileName = [System.IO.Path]::GetFileNameWithoutExtension($InputPath) + "_cga.png"
-        if ($sfd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { 
-            $InputImage.Dispose()
-            exit 
-        }
-        $OutputPath = $sfd.FileName
-        
-        # Dispose of the input image as we're done with it
         $InputImage.Dispose()
-        
-        # Final conversion for saving
-        Convert-Image -InputPath $InputPath -OutputPath $OutputPath -Width $Width -Palette $Palette -DitherMethod $DitherMethod
-        
-        [System.Windows.Forms.MessageBox]::Show("Conversion successful!","Done",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information)
-        Start-Process "$OutputPath"
-        
-    } else {
-        # Command-Line Mode
-        if (-not $Output) {
-            Write-Error "The -Output parameter is required in command-line mode."
-            throw "The -Output parameter is required when running in command-line mode."
+
+        if ($script:inputFiles.Count -gt 1) {
+            # Batch Mode
+            $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+            $fbd.Description = "Select a folder to save converted images."
+            if ($fbd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { exit }
+
+            $OutputPath = $fbd.SelectedPath
+            
+            $i = 1
+            foreach ($file in $script:inputFiles) {
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                $ext = [System.IO.Path]::GetExtension($file)
+                $outputFile = Join-Path -Path $OutputPath -ChildPath "$baseName`_cga.png"
+
+                Write-Host "Converting file $i of $($script:inputFiles.Count): $file"
+                Convert-Image -InputPath $file -OutputPath $outputFile -Factor $Factor -Palette $Palette -DitherMethod $DitherMethod -Filter $Filter -ProcessingPath $ProcessingPath
+                $i++
+            }
+            [System.Windows.Forms.MessageBox]::Show("Batch conversion complete!","Done",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information)
+            Start-Process "$OutputPath"
+            
+        } else {
+            # Single File Mode
+            $sfd = New-Object System.Windows.Forms.SaveFileDialog
+            $sfd.Filter = "PNG Image|*.png"
+            $sfd.Title = "Save Output Image"
+            $sfd.FileName = [System.IO.Path]::GetFileNameWithoutExtension($InputPath) + "_cga.png"
+            if ($sfd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { exit }
+            $OutputPath = $sfd.FileName
+            
+            Convert-Image -InputPath $InputPath -OutputPath $OutputPath -Factor $Factor -Palette $Palette -DitherMethod $DitherMethod -Filter $Filter -ProcessingPath $ProcessingPath
+            
+            [System.Windows.Forms.MessageBox]::Show("Conversion successful!","Done",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information)
+            Start-Process "$OutputPath"
         }
-        
-        if (-not (Test-Path $Input)) {
-            Write-Error "Input file does not exist: $Input"
-            throw "Input file does not exist: $Input"
-        }
-        
-        $InputPath = (Resolve-Path $Input).Path
-        $OutputPath = $Output
-        
-        # Perform command-line conversion
-        Convert-Image -InputPath $InputPath -OutputPath $OutputPath -Width $Width -Palette $Palette -DitherMethod $DitherMethod
     }
 
 } catch {
@@ -465,11 +687,6 @@ try {
     [System.Windows.Forms.MessageBox]::Show("Error during conversion: $($_.Exception.Message)","Error",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
     exit 1
 } finally {
-    # Final cleanup of all persistent temporary files
-    if (Test-Path $script:previewTempFile -ErrorAction SilentlyContinue) {
-        Remove-Item $script:previewTempFile -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path $script:previewPaletteFile -ErrorAction SilentlyContinue) {
-        Remove-Item $script:previewPaletteFile -Force -ErrorAction SilentlyContinue
-    }
+    if (Test-Path $script:previewTempFile -ErrorAction SilentlyContinue) { Remove-Item $script:previewTempFile -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $script:previewPaletteFile -ErrorAction SilentlyContinue) { Remove-Item $script:previewPaletteFile -Force -ErrorAction SilentlyContinue }
 }
