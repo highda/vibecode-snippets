@@ -4,7 +4,6 @@ on:
   push:
     paths:
       - '**.ps1'
-      - '!**.min.ps1'
 
 jobs:
   minify-powershell:
@@ -16,7 +15,5 @@ jobs:
     - name: Minify PowerShell scripts
       uses: StartAutomating/PSMinifier@v1.1.3
       with:
-        Include: 'powershell/convertto-cga/Convert-ToCGA.ps1'
-        Exclude: '**/*.min.ps1'
         GZip: false
         CommitMessage: "Minified PowerShell scripts."
