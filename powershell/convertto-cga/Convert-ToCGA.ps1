@@ -8,7 +8,7 @@ param(
     [string]$DitherMethod = "FloydSteinberg",
     [string]$Filter = "Point",
     [string]$ProcessingPath = "FirstDownscale"
-)
+)#mintst
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
