@@ -125,6 +125,94 @@ javascript:(async()=>{
     return result;
   }
 
+  /* ── ZIP download helpers ── */
+  async function loadJSZip() {
+    if (window.JSZip) return window.JSZip;
+    await new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+      s.onload = res;
+      s.onerror = rej;
+      document.head.appendChild(s);
+    });
+    return window.JSZip;
+  }
+
+  function sanitizeName(name) {
+    return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim() || "font";
+  }
+
+  async function downloadFonts(selectedFonts, statusCb) {
+    statusCb("Loading ZIP library…");
+    const JSZip = await loadJSZip();
+    const zip = new JSZip();
+
+    // Count how many families share the same sanitized base name
+    const baseCounts = new Map();
+    for (const font of selectedFonts) {
+      const base = sanitizeName(font.family);
+      baseCounts.set(base, (baseCounts.get(base) || 0) + 1);
+    }
+    // Assign unique folder names: same-base families get _1, _2, …
+    const baseIdx = new Map();
+    const folderMap = new Map();
+    for (const font of selectedFonts) {
+      const base = sanitizeName(font.family);
+      if (baseCounts.get(base) === 1) {
+        folderMap.set(font.family, base);
+      } else {
+        const idx = (baseIdx.get(base) || 0) + 1;
+        baseIdx.set(base, idx);
+        folderMap.set(font.family, `${base}_${idx}`);
+      }
+    }
+
+    let done = 0;
+    await Promise.all(selectedFonts.map(async font => {
+      const folder = zip.folder(folderMap.get(font.family));
+
+      // Collect unique URLs across all entries for this family
+      const seenUrls = new Set();
+      const urls = [];
+      for (const entry of font.entries) {
+        for (const url of entry.urls) {
+          if (!seenUrls.has(url)) { seenUrls.add(url); urls.push(url); }
+        }
+      }
+
+      // Fetch each URL; deduplicate filenames within the folder
+      const usedFileNames = new Set();
+      for (const url of urls) {
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) continue;
+          const blob = await resp.blob();
+          const raw = decodeURIComponent(url.split("/").pop().split("?")[0]) || "font";
+          const sane = sanitizeName(raw);
+          const ext = sane.includes(".") ? "." + sane.split(".").pop() : "";
+          const stem = ext ? sane.slice(0, -ext.length) : sane;
+          let name = sane;
+          let c = 1;
+          while (usedFileNames.has(name)) name = `${stem}_${c++}${ext}`;
+          usedFileNames.add(name);
+          folder.file(name, blob);
+        } catch {}
+      }
+
+      done++;
+      statusCb(`Fetching fonts… ${done}/${selectedFonts.length}`);
+    }));
+
+    statusCb("Generating ZIP…");
+    const content = await zip.generateAsync({ type: "blob" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(content);
+    a.download = "fonts.zip";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    statusCb(null);
+  }
+
   /* ── Display UI ── */
   function showUI(fonts) {
     if (fonts.length === 0) {
@@ -154,7 +242,8 @@ javascript:(async()=>{
       #font-inspector-overlay .font-preview{font-size:1em;margin:6px 0;white-space:pre-line;outline:none;font-weight:400;font-style:normal;text-decoration:none}
       #font-inspector-overlay details summary{cursor:pointer;font-size:14px}
       #font-inspector-overlay .overlay-btn{background:var(--bg-color,#fff);color:var(--fg-color,#000);border:1px solid var(--fg-color,#000);border-radius:4px;padding:6px 12px;margin-left:10px;cursor:pointer;font-size:14px;user-select:none;transition:background-color .2s,color .2s}
-      #font-inspector-overlay .overlay-btn:hover{background:var(--fg-color,#000);color:var(--bg-color,#fff)}
+      #font-inspector-overlay .overlay-btn:hover:not(:disabled){background:var(--fg-color,#000);color:var(--bg-color,#fff)}
+      #font-inspector-overlay .overlay-btn:disabled{opacity:.4;cursor:default}
       #font-inspector-overlay #close-btn{background:#fff!important;color:#000!important;border:1px solid #000!important;box-shadow:none!important;font-weight:400!important;margin-left:0}
       #font-inspector-overlay #close-btn:hover{background:#000!important;color:#fff!important}
       #font-inspector-overlay .toggle-btn{font-size:14px;width:28px;height:28px;margin-right:6px;border:1px solid var(--fg-color,#000);cursor:pointer;border-radius:4px;background:var(--bg-color,#fff);color:var(--fg-color,#000);transition:background-color .2s,color .2s;user-select:none;display:inline-flex;justify-content:center;align-items:center}
@@ -170,13 +259,15 @@ javascript:(async()=>{
       #font-inspector-overlay .font-block-controls input[type=number]{width:60px;padding:3px 6px;font-size:14px;border:1px solid var(--fg-color,#000);border-radius:4px;background:var(--bg-color,#fff);color:var(--fg-color,#000);user-select:text}
       #font-inspector-overlay .font-style-note{font-size:12px;font-style:italic;opacity:.7;margin-left:18px}
       #font-inspector-overlay hr{margin:10px 0;border:none;border-top:1px solid var(--fg-color,#000)}
+      #font-inspector-overlay .font-checkbox{width:16px;height:16px;cursor:pointer;flex-shrink:0;accent-color:var(--fg-color,#000)}
+      #font-inspector-overlay .dl-status{font-size:13px;opacity:.7;min-width:160px}
     `;
     document.head.appendChild(uiStyle);
 
     overlay.innerHTML = "";
     overlay.style = "";
 
-    // Top controls
+    /* top controls bar */
     const controls = document.createElement("div");
     controls.className = "top-controls";
 
@@ -204,21 +295,90 @@ javascript:(async()=>{
     bgInput.oninput = () => overlay.style.setProperty("--bg-color", bgInput.value);
     controls.appendChild(bgLabel);
 
+    const dlAllBtn = document.createElement("button");
+    dlAllBtn.textContent = "Download All";
+    dlAllBtn.className = "overlay-btn";
+    controls.appendChild(dlAllBtn);
+
+    const dlSelBtn = document.createElement("button");
+    dlSelBtn.textContent = "Download Selected (0)";
+    dlSelBtn.className = "overlay-btn";
+    dlSelBtn.disabled = true;
+    controls.appendChild(dlSelBtn);
+
+    const statusEl = document.createElement("span");
+    statusEl.className = "dl-status";
+    controls.appendChild(statusEl);
+
     overlay.appendChild(controls);
 
+    const placeholder = `${fonts.length} famil${fonts.length === 1 ? "y" : "ies"} found`;
+
+    /* per-font toggle helpers */
     function applyToggles(preview, controlsEl) {
       preview.style.fontWeight = controlsEl.querySelector(".bold.active") ? "bold" : "normal";
       preview.style.fontStyle = controlsEl.querySelector(".italic.active") ? "italic" : "normal";
       preview.style.textDecoration = controlsEl.querySelector(".underline.active") ? "underline" : "none";
     }
 
-    // Font entries
-    fonts.forEach(font => {
+    /* checkbox tracking */
+    const checkboxes = [];
+
+    function updateSelBtn() {
+      const n = checkboxes.filter(c => c.checked).length;
+      dlSelBtn.textContent = `Download Selected (${n})`;
+      dlSelBtn.disabled = n === 0;
+    }
+
+    function setDownloading(busy) {
+      dlAllBtn.disabled = busy;
+      dlSelBtn.disabled = busy || checkboxes.filter(c => c.checked).length === 0;
+      checkboxes.forEach(c => { c.disabled = busy; });
+    }
+
+    statusEl.textContent = placeholder;
+
+    const statusCb = msg => {
+      statusEl.textContent = msg || placeholder;
+      if (!msg) setDownloading(false);
+    };
+
+    dlAllBtn.onclick = async () => {
+      setDownloading(true);
+      try {
+        await downloadFonts(fonts, statusCb);
+      } catch (e) {
+        statusEl.textContent = "Error: " + e.message;
+        setDownloading(false);
+      }
+    };
+
+    dlSelBtn.onclick = async () => {
+      const sel = fonts.filter((_, i) => checkboxes[i] && checkboxes[i].checked);
+      setDownloading(true);
+      try {
+        await downloadFonts(sel, statusCb);
+      } catch (e) {
+        statusEl.textContent = "Error: " + e.message;
+        setDownloading(false);
+      }
+    };
+
+    /* font entries */
+    fonts.forEach((font, fontIdx) => {
       const sample = document.createElement("div");
       sample.className = "font-sample";
 
       const title = document.createElement("div");
       title.className = "font-title";
+
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.className = "font-checkbox";
+      cb.title = "Select for download";
+      cb.onchange = updateSelBtn;
+      checkboxes[fontIdx] = cb;
+      title.appendChild(cb);
 
       const details = document.createElement("details");
       const summary = document.createElement("summary");
@@ -252,7 +412,7 @@ javascript:(async()=>{
 
       const preview = document.createElement("div");
       preview.className = "font-preview";
-      preview.textContent = "The quick brown fox jumps over the lazy dog\nP\u0159\u00edli\u0161 \u017elu\u0165ou\u010dk\u00fd k\u016f\u0148 \u00fap\u011bl \u010f\u00e1belsk\u00e9 \u00f3dy";
+      preview.textContent = "The quick brown fox jumps over the lazy dog\nPříliš žluťoučký kůň úpěl ďábelské ódy";
       preview.style.fontFamily = font.family;
       sample.appendChild(preview);
 
@@ -269,7 +429,7 @@ javascript:(async()=>{
       });
 
       const editBtn = document.createElement("button");
-      editBtn.textContent = "\u270e";
+      editBtn.textContent = "✎";
       editBtn.title = "Toggle edit example texts";
       editBtn.className = "toggle-btn";
       let editable = false;
