@@ -4,9 +4,9 @@ A bookmarklet that discovers all `@font-face` fonts on any webpage and displays 
 
 ## Installation
 
-1. Open `minified.js` and copy the entire contents.
-2. Create a new bookmark in your browser.
-3. Paste the code as the bookmark URL.
+Open **[the install page](https://highda.github.io/vibecode-snippets/bookmarklets/font-ripper/)** and drag the *Font Ripper* button to your bookmarks bar. The page is built from `minified.js` on `main`, so it always installs the latest version.
+
+Manual alternative: copy the contents of `minified.js` and paste it as the URL of a new bookmark.
 
 ## Usage
 
