@@ -1,5 +1,5 @@
 javascript:(async()=>{
-  /* ── Loading splash ── */
+  /* ── Loading splash (DOM APIs only: innerHTML breaks on Trusted Types pages) ── */
   const overlay = document.createElement("div");
   overlay.id = "font-inspector-overlay";
   const splashStyle = document.createElement("style");
@@ -16,118 +16,464 @@ javascript:(async()=>{
     @keyframes fi-spin{to{transform:rotate(360deg)}}
   `;
   document.head.appendChild(splashStyle);
-  overlay.innerHTML = '<div class="spinner"></div> Loading fonts…';
+  const spinner = document.createElement("div");
+  spinner.className = "spinner";
+  const splashText = document.createElement("span");
+  splashText.textContent = "Loading fonts…";
+  overlay.append(spinner, splashText);
   document.body.appendChild(overlay);
+  const setSplash = msg => { splashText.textContent = msg; };
 
-  /* ── Collect all stylesheets ── */
-  function getAllSheets() {
+  const FONT_EXT = /\.(woff2?|ttf|otf|eot)(\?|#|$)/i;
+  const NON_FONT_EXT = /\.(css|m?js|json|map|html?|php|xml|txt|png|jpe?g|gif|svg|webp|avif|ico|bmp|mp4|webm|mov|mp3|wav|ogg|wasm|pdf|zip)(\?|#|$)/i;
+  const MAGIC = ["wOF2", "wOFF", "OTTO", "true", "ttcf", "\x00\x01\x00\x00"];
+  const cleanFamily = s => s.replace(/["']/g, "").trim();
+  const norm = s => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const fileName = url => { try { return decodeURIComponent(url.split("/").pop().split(/[?#]/)[0]) || url; } catch { return url; } };
+
+  /* ── Run async tasks with limited concurrency ── */
+  async function pool(items, limit, fn) {
+    let i = 0;
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (i < items.length) { const item = items[i++]; await fn(item); }
+    }));
+  }
+
+  /* ── Binary font parsing: sniff format, read name + OS/2 tables ── */
+  const tagAt = (u8, o) => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+  let brotliPromise;
+  function loadBrotli() {
+    // WOFF2 is brotli-compressed; browsers expose no brotli decoder to JS, so load a small one on demand
+    brotliPromise ||= import("https://cdn.jsdelivr.net/npm/brotli@1.3.3/decompress.js/+esm").then(m => m.default).catch(() => null);
+    return brotliPromise;
+  }
+  async function inflate(bytes) {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+  const WOFF2_TAGS = "cmap head hhea hmtx maxp name OS/2 post cvt  fpgm glyf loca prep CFF  VORG EBDT EBLC gasp hdmx kern LTSH PCLT VDMX vhea vmtx BASE GDEF GPOS GSUB EBSC JSTF MATH CBDT CBLC COLR CPAL SVG  sbix acnt avar bdat bloc bsln cvar fdsc feat fmtx fvar gvar hsty just lcar mort morx opbd prop trak Zapf Silf Glat Gloc Feat Sill".match(/.{4} ?/g).map(t => t.slice(0, 4));
+
+  // Returns { tagName: Uint8Array } for the requested tables
+  async function getTables(u8, wanted) {
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const magic = tagAt(u8, 0);
+    const out = {};
+    if (magic === "wOFF") {
+      const n = dv.getUint16(12);
+      for (let i = 0; i < n; i++) {
+        const o = 44 + i * 20, tag = tagAt(u8, o);
+        if (!wanted.includes(tag)) continue;
+        const off = dv.getUint32(o + 4), comp = dv.getUint32(o + 8), orig = dv.getUint32(o + 12);
+        const data = u8.subarray(off, off + comp);
+        out[tag] = comp < orig ? await inflate(data) : data;
+      }
+    } else if (magic === "wOF2") {
+      const n = dv.getUint16(12);
+      let p = 48;
+      const base128 = () => { let v = 0; for (let i = 0; i < 5; i++) { const b = u8[p++]; v = v * 128 + (b & 127); if (!(b & 128)) break; } return v; };
+      const dir = [];
+      for (let i = 0; i < n; i++) {
+        const flags = u8[p++];
+        let tag;
+        if ((flags & 63) === 63) { tag = tagAt(u8, p); p += 4; } else tag = WOFF2_TAGS[flags & 63];
+        const orig = base128();
+        const xform = flags >> 6;
+        const transformed = (tag === "glyf" || tag === "loca") ? xform === 0 : xform !== 0;
+        dir.push({ tag, len: transformed ? base128() : orig });
+      }
+      if (tagAt(u8, 4) === "ttcf") return out; // collections: skip
+      const brotli = await loadBrotli();
+      if (!brotli) return out;
+      const data = brotli(u8.subarray(p, p + dv.getUint32(20)));
+      let off = 0;
+      for (const { tag, len } of dir) {
+        if (wanted.includes(tag)) out[tag] = data.subarray(off, off + len);
+        off += len;
+      }
+    } else if (["OTTO", "true", "\x00\x01\x00\x00"].includes(magic)) {
+      const n = dv.getUint16(4);
+      for (let i = 0; i < n; i++) {
+        const o = 12 + i * 16, tag = tagAt(u8, o);
+        if (wanted.includes(tag)) out[tag] = u8.subarray(dv.getUint32(o + 8), dv.getUint32(o + 8) + dv.getUint32(o + 12));
+      }
+    }
+    return out;
+  }
+
+  // { family, subfamily, full, ps, weight, italic } or null
+  async function readFontInfo(u8) {
+    let t;
+    try { t = await getTables(u8, ["name", "OS/2"]); } catch { return null; }
+    if (!t.name) return null;
+    const nd = new DataView(t.name.buffer, t.name.byteOffset, t.name.byteLength);
+    const count = nd.getUint16(2), strOff = nd.getUint16(4);
+    const names = {};
+    for (let i = 0; i < count; i++) {
+      const o = 6 + i * 12;
+      const plat = nd.getUint16(o), lang = nd.getUint16(o + 4), id = nd.getUint16(o + 6);
+      const len = nd.getUint16(o + 8), off = strOff + nd.getUint16(o + 10);
+      const bytes = t.name.subarray(off, off + len);
+      let s;
+      if (plat === 3 || plat === 0) { s = ""; for (let j = 0; j + 1 < bytes.length; j += 2) s += String.fromCharCode((bytes[j] << 8) | bytes[j + 1]); }
+      else if (plat === 1) s = String.fromCharCode(...bytes);
+      else continue;
+      // Prefer Windows English, then anything
+      const score = (plat === 3 && lang === 0x409) ? 2 : 1;
+      if (!names[id] || names[id].score < score) names[id] = { s, score };
+    }
+    const n = id => names[id] && names[id].s.trim();
+    const info = { family: n(16) || n(1), subfamily: n(17) || n(2), full: n(4), ps: n(6), weight: 400, italic: false };
+    if (t["OS/2"] && t["OS/2"].length > 63) {
+      const od = new DataView(t["OS/2"].buffer, t["OS/2"].byteOffset);
+      info.weight = od.getUint16(4) || 400;
+      info.italic = !!(od.getUint16(62) & 1);
+    }
+    return info.family ? info : null;
+  }
+
+  /* ── Glyph signatures: advance widths + ink bounds per character ── */
+  const sigCtx = document.createElement("canvas").getContext("2d");
+  const PROBE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789&@?!%";
+  const parseRange = unicodeRange => (unicodeRange || "U+0-10FFFF").split(",").map(part => {
+    const [a, b] = part.trim().replace(/^U\+/i, "").split("-");
+    return a.includes("?") ? [parseInt(a.replace(/\?/g, "0"), 16), parseInt(a.replace(/\?/g, "F"), 16)] : [parseInt(a, 16), parseInt(b || a, 16)];
+  });
+  const inRanges = (c, ranges) => ranges.some(([a, b]) => c >= a && c <= b);
+  // Probe characters only this face renders: inside its unicode-range (subsets like Google Fonts' cyrillic
+  // never cover ASCII) and outside sibling faces' ranges (overlapping code points go to another subset)
+  function probeFor(face, siblings) {
+    const own = parseRange(face.unicodeRange);
+    const others = siblings.map(f => parseRange(f.unicodeRange));
+    const usable = c => c > 0x20 && (c < 0x7f || c > 0xa0) && !others.some(r => inRanges(c, r));
+    const chars = [...PROBE].filter(ch => inRanges(ch.codePointAt(0), own) && usable(ch.codePointAt(0)));
+    for (const [a, b] of own) {
+      for (let c = a; c <= b && c < 0x30000 && chars.length < 70; c++) {
+        if (usable(c) && !chars.includes(String.fromCodePoint(c))) chars.push(String.fromCodePoint(c));
+      }
+    }
+    return chars.join("") || PROBE;
+  }
+  function signature(fontSpec, probe = PROBE) {
+    sigCtx.font = fontSpec;
+    return [...probe].map(ch => {
+      const m = sigCtx.measureText(ch);
+      return [m.width, m.actualBoundingBoxLeft, m.actualBoundingBoxRight, m.actualBoundingBoxAscent, m.actualBoundingBoxDescent].map(v => v.toFixed(1)).join(":");
+    }).join(",");
+  }
+  const faceSpec = (face, family) => {
+    const weight = String(face.weight).split(" ")[0];
+    const stretch = /^\d/.test(face.stretch) ? "normal" : String(face.stretch).split(" ")[0];
+    return `${face.style.split(" ")[0]} ${weight} ${stretch} 100px "${family}", monospace`;
+  };
+
+  /* ── Documents: top page + same-origin iframes; cross-origin frames are reported ── */
+  function collectDocs() {
+    const docs = [], foreignFrames = [];
+    (function walk(doc) {
+      docs.push(doc);
+      for (const f of doc.querySelectorAll("iframe, frame")) {
+        let d = null;
+        try { d = f.contentDocument; } catch {}
+        if (d && d.documentElement) walk(d);
+        else if (/^https?:/.test(f.src)) foreignFrames.push(f.src);
+      }
+    })(document);
+    return { docs, foreignFrames: [...new Set(foreignFrames)] };
+  }
+
+  /* ── Collect all stylesheets (document, shadow roots, adopted) ── */
+  function getAllSheets(docs) {
     const sheets = [];
-    const addSheet = (sheet, base) => sheets.push({ sheet, base });
     const addRoot = (root, base) => {
-      for (const s of root.styleSheets) addSheet(s, base);
-      for (const s of (root.adoptedStyleSheets || [])) addSheet(s, base);
+      for (const s of root.styleSheets) sheets.push({ sheet: s, base });
+      for (const s of (root.adoptedStyleSheets || [])) sheets.push({ sheet: s, base });
     };
-    addRoot(document, document.baseURI);
-    const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_ELEMENT);
-    let node;
-    while ((node = walker.nextNode())) {
-      if (node.shadowRoot) addRoot(node.shadowRoot, document.baseURI);
+    for (const doc of docs) {
+      addRoot(doc, doc.baseURI);
+      const walker = doc.createTreeWalker(doc.documentElement, NodeFilter.SHOW_ELEMENT);
+      let node;
+      while ((node = walker.nextNode())) {
+        if (node.shadowRoot) addRoot(node.shadowRoot, doc.baseURI);
+      }
     }
     return sheets;
   }
 
-  /* ── Extract @font-face declarations (async for fetch fallback) ── */
+  /* ── Parse @font-face / @import out of raw CSS text ── */
+  function parseCssText(text, base) {
+    const faces = [], imports = [];
+    text = text.replace(/\/\*[\s\S]*?\*\//g, "");
+    for (const [, block] of text.matchAll(/@font-face\s*\{([^}]*)\}/gi)) {
+      const fam = (block.match(/font-family\s*:\s*(["']?)([^;"'}]+)\1/i) || [])[2];
+      if (!fam) continue;
+      const src = (block.match(/(?:^|[;{\s])src\s*:\s*([^;]+)/i) || [])[1] || "";
+      const urls = [];
+      for (const [, , u] of src.matchAll(/url\(\s*(["']?)([^"')]+)\1\s*\)/g)) {
+        try { urls.push(new URL(u.trim(), base).href); } catch {}
+      }
+      if (urls.length) faces.push({ family: fam.trim(), urls, style: block.trim() });
+    }
+    for (const [, a, b] of text.matchAll(/@import\s+(?:url\(\s*["']?([^"')]+)["']?\s*\)|["']([^"']+)["'])/gi)) {
+      try { imports.push(new URL(a || b, base).href); } catch {}
+    }
+    return { faces, imports };
+  }
+
+  /* ── Extract fonts: every discovery source, then verify + attribute ── */
   async function extractFonts() {
+    // Record everything we trigger from here on, even on resource-heavy pages
+    try { performance.setResourceTimingBufferSize(100000); } catch {}
+    const { docs, foreignFrames } = collectDocs();
     const found = new Map();
+    const add = (family, urls, style, source, label) => {
+      const key = family + "|" + urls.slice().sort().join(",") + "|" + style;
+      if (!found.has(key)) found.set(key, { family, label, entry: { urls, style, source } });
+    };
 
-    // Pass 1: readable cssRules
-    for (const { sheet, base: baseURI } of getAllSheets()) {
+    // Pass 1: readable cssRules, recursing into @import and @media/@supports/@layer/… blocks
+    const unreadable = new Set();
+    const seenSheets = new Set();
+    const walkSheet = (sheet, base) => {
+      if (seenSheets.has(sheet)) return;
+      seenSheets.add(sheet);
+      const sheetBase = sheet.href || base;
       let rules;
-      try { rules = sheet.cssRules; } catch { continue; }
-      if (!rules) continue;
-      const origin = sheet.href ? new URL(sheet.href, baseURI) : new URL(baseURI);
+      try { rules = sheet.cssRules; } catch { if (sheet.href) unreadable.add(sheet.href); return; }
+      if (rules) walkRules(rules, sheetBase);
+    };
+    const walkRules = (rules, base) => {
       for (const rule of rules) {
-        if (rule.type === CSSRule.FONT_FACE_RULE) {
+        if (rule.type === 5) { // CSSRule.FONT_FACE_RULE (instanceof fails across iframes)
           const style = rule.style;
-          const family = style.getPropertyValue("font-family").replace(/["']/g, "").trim();
-          const srcs = [];
-          for (let i = 0; i < style.length; i++) {
-            if (style[i] === "src") srcs.push(style.getPropertyValue(style[i]));
-          }
-          if (!srcs.length) continue;
+          const family = cleanFamily(style.getPropertyValue("font-family"));
           const urls = [];
-          srcs.join(", ").replace(/url\(([^)]+)\)/g, (_, u) => {
-            const clean = u.replace(/["']/g, "").trim();
-            try { urls.push(new URL(clean, origin).href); } catch {}
+          style.getPropertyValue("src").replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/g, (_, q, u) => {
+            try { urls.push(new URL(u.trim(), base).href); } catch {}
           });
-          if (!urls.length) continue;
-          const key = family + "|" + urls.slice().sort().join(",") + "|" + style.cssText;
-          if (!found.has(key)) found.set(key, { family, entry: { urls, style: style.cssText } });
+          if (family && urls.length) add(family, urls, style.cssText, "CSS @font-face");
+        } else if (rule.type === 3 && rule.styleSheet) {
+          walkSheet(rule.styleSheet, base);
         }
+        if (rule.cssRules) walkRules(rule.cssRules, base);
+      }
+    };
+    for (const { sheet, base } of getAllSheets(docs)) walkSheet(sheet, base);
+
+    // Pass 2: regex scan inline <style> tags (catches rules the CSSOM dropped)
+    for (const doc of docs) {
+      for (const styleEl of doc.querySelectorAll("style")) {
+        const { faces, imports } = parseCssText(styleEl.textContent, doc.baseURI);
+        faces.forEach(f => add(f.family, f.urls, f.style, "CSS @font-face"));
+        imports.forEach(u => unreadable.add(u));
       }
     }
 
-    // Pass 2: regex scan inline <style> tags
-    for (const styleEl of document.querySelectorAll("style")) {
-      const text = styleEl.textContent;
-      const blocks = [...text.matchAll(/@font-face\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}/gi)];
-      for (const [, block] of blocks) {
-        const fam = (block.match(/font-family\s*:\s*["']?([^;"']+)["']?\s*[;}]/i) || [])[1];
-        if (!fam) continue;
-        const family = fam.trim();
-        const srcM = (block.match(/src\s*:\s*([^;]+(?:;[^}]*)?)(?=\s*(?:font-|unicode-|font-display|ascent|descent|line-gap|\}))/i) || block.match(/src\s*:\s*([^;]+);/i) || [])[1];
-        if (!srcM) continue;
-        const urls = [];
-        srcM.replace(/url\(["']?([^"')]+)["']?\)/g, (_, u) => {
-          try { urls.push(new URL(u, document.baseURI).href); } catch {}
-        });
-        if (!urls.length) continue;
-        const key = family + "|" + urls.slice().sort().join(",");
-        if (!found.has(key)) found.set(key, { family, entry: { urls, style: block.trim() } });
+    // Pass 3: fetch CORS-blocked sheets and follow their @imports
+    setSplash("Fetching cross-origin stylesheets…");
+    const fetchedSheets = new Set();
+    let queue = [...unreadable];
+    for (let depth = 0; depth < 4 && queue.length; depth++) {
+      const next = [];
+      await pool(queue.filter(u => !fetchedSheets.has(u)), 6, async href => {
+        fetchedSheets.add(href);
+        try {
+          const { faces, imports } = parseCssText(await (await fetch(href)).text(), href);
+          faces.forEach(f => add(f.family, f.urls, f.style, "CSS @font-face"));
+          next.push(...imports);
+        } catch {}
+      });
+      queue = next;
+    }
+
+    const claimed = new Set();
+    const cssFamilies = new Set();
+    for (const { family, entry } of found.values()) {
+      cssFamilies.add(family);
+      entry.urls.forEach(u => claimed.add(u));
+    }
+
+    // Pass 4: fonts registered from JS (new FontFace + document.fonts.add) never appear in CSS.
+    // Load any that are still unloaded so their files show up in resource timing.
+    const jsFaces = [];
+    for (const doc of docs) {
+      for (const face of doc.fonts) {
+        const family = cleanFamily(face.family);
+        if (!cssFamilies.has(family) && !family.startsWith("font-ripper-")) jsFaces.push({ face, family });
+      }
+    }
+    const pending = jsFaces.filter(({ face }) => face.status === "unloaded");
+    if (pending.length) {
+      setSplash(`Loading ${pending.length} unused JS fonts…`);
+      await Promise.race([
+        Promise.allSettled(pending.map(({ face }) => face.load())),
+        new Promise(r => setTimeout(r, 8000)),
+      ]);
+    }
+
+    // Pass 5: candidate files from resource timing (any extension — sniffed below)
+    const candidates = new Map();
+    for (const doc of docs) {
+      for (const e of doc.defaultView.performance.getEntriesByType("resource")) {
+        const u = e.name;
+        if (claimed.has(u) || !/^https?:/.test(u) || NON_FONT_EXT.test(u)) continue;
+        if (["img", "image", "script", "iframe", "navigation", "video", "audio", "track"].includes(e.initiatorType)) continue;
+        if (!candidates.has(u)) candidates.set(u, { source: "loaded", knownFont: FONT_EXT.test(u) });
       }
     }
 
-    // Pass 3: fetch CORS-blocked external sheets
-    const fetchPromises = [];
-    for (const sheet of document.styleSheets) {
-      if (!sheet.href) continue;
-      let readable = true;
-      try { sheet.cssRules; } catch { readable = false; }
-      if (readable) continue;
-      fetchPromises.push(
-        fetch(sheet.href).then(r => r.text()).then(text => {
-          const blocks = [...text.matchAll(/@font-face\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}/gi)];
-          for (const [, block] of blocks) {
-            const fam = (block.match(/font-family\s*:\s*["']?([^;"']+)["']?\s*[;}]/i) || [])[1];
-            if (!fam) continue;
-            const family = fam.trim();
-            const urls = [];
-            block.replace(/url\(["']?([^"')]+)["']?\)/g, (_, u) => {
-              try { urls.push(new URL(u, sheet.href).href); } catch {}
-            });
-            if (!urls.length) continue;
-            const key = family + "|" + urls.slice().sort().join(",");
-            if (!found.has(key)) found.set(key, { family, entry: { urls, style: block.trim() } });
-          }
-        }).catch(() => {})
-      );
+    // Pass 6: font file paths mentioned in page source / embedded JSON (e.g. unselected type-tester styles)
+    const fontDirs = new Set([...claimed, ...[...candidates.keys()].filter(u => FONT_EXT.test(u))]
+      .map(u => u.replace(/[^/]*$/, "")));
+    const sourceRefs = new Set();
+    for (const doc of docs) {
+      const html = doc.documentElement.outerHTML.replace(/\\u002[fF]/g, "/").replace(/\\\//g, "/");
+      for (const [, path] of html.matchAll(/["'(\s=]((?:https?:)?[^"'()\s<>\\]*?\.(?:woff2?|ttf|otf))(?=[?#"'()\s\\]|$)/gi)) sourceRefs.add({ path, base: doc.baseURI });
     }
-    await Promise.all(fetchPromises);
+    const stripQuery = u => u.split(/[?#]/)[0];
+    const knownBare = new Set([...claimed, ...candidates.keys()].map(stripQuery));
+    const sourceCandidates = [];
+    for (const { path, base } of sourceRefs) {
+      const bases = /^(https?:)?\/\//.test(path) || path.startsWith("/") ? [base] : [base, ...fontDirs];
+      const urls = [];
+      for (const b of bases) { try { urls.push(new URL(path, b).href); } catch {} }
+      if (!urls.some(u => knownBare.has(stripQuery(u)))) sourceCandidates.push(urls);
+    }
+
+    // Verify candidates by magic bytes and keep the bytes for naming/matching
+    setSplash("Verifying font files…");
+    const files = new Map(); // url -> { bytes, source }
+    const fetchFont = async url => {
+      const r = await fetch(url);
+      if (!r.ok) return null;
+      const u8 = new Uint8Array(await r.arrayBuffer());
+      return u8.length > 12 && MAGIC.includes(tagAt(u8, 0)) ? u8 : null;
+    };
+    await pool([...candidates], 6, async ([url, c]) => {
+      let bytes = null;
+      try { bytes = await fetchFont(url); } catch {}
+      if (bytes) files.set(url, { bytes, source: c.source });
+      else if (c.knownFont) files.set(url, { bytes: null, source: c.source }); // unreadable (CORS) but clearly a font
+    });
+    await pool(sourceCandidates.slice(0, 400), 6, async urls => {
+      for (const url of urls) {
+        if (files.has(url)) return;
+        try {
+          const bytes = await fetchFont(url);
+          if (bytes) { files.set(url, { bytes, source: "page source" }); return; }
+        } catch {}
+      }
+    });
+
+    // Identify files: internal names + content hash (identical bytes = same font)
+    setSplash(`Identifying ${files.size} font files…`);
+    for (const f of files.values()) {
+      if (!f.bytes) continue;
+      f.info = await readFontInfo(f.bytes);
+      f.hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-1", f.bytes)), b => b.toString(16).padStart(2, "0")).join("");
+    }
+    // Identical bytes under another URL: a page-source hit is redundant, a second loaded URL becomes an alias
+    const byHash = new Map();
+    for (const [url, f] of [...files].sort((a, b) => (a[1].source === "page source") - (b[1].source === "page source"))) {
+      if (!f.hash) continue;
+      const first = byHash.get(f.hash);
+      if (!first) { byHash.set(f.hash, f); f.aliases = []; continue; }
+      if (f.source !== "page source") first.aliases.push(url);
+      files.delete(url);
+    }
+
+    // Attribute files to JS families. Two independent kinds of evidence:
+    //  a) glyph signature: render the file under each JS face's own descriptors/unicode-range and compare
+    //     with how the page renders that face — physical proof, wins whenever the face is loaded
+    //  b) internal font name vs. JS family name — tie-breaker, and fallback for faces that never loaded
+    const jsFamilies = [...new Set(jsFaces.map(j => j.family))];
+    const nameHits = f => {
+      if (!f.info) return [];
+      const strong = new Set([f.info.ps, f.info.full, f.info.family + f.info.subfamily].map(norm));
+      const weak = norm(f.info.family);
+      const scored = jsFamilies.map(fam => {
+        const k = norm(fam.replace(/^_+/, ""));
+        return { fam, score: strong.has(k) || strong.has(norm(fam)) ? 2 : k === weak || norm(fam) === weak ? 1 : 0 };
+      }).filter(h => h.score);
+      const best = Math.max(0, ...scored.map(h => h.score));
+      return scored.filter(h => h.score === best).map(h => h.fam);
+    };
+    const loadedJsFaces = jsFaces.filter(({ face }) => face.status === "loaded").map(j => {
+      const siblings = jsFaces.filter(o => o !== j && o.family === j.family && o.face.style === j.face.style && o.face.weight === j.face.weight && o.face.stretch === j.face.stretch).map(o => o.face);
+      const probe = probeFor(j.face, siblings);
+      return { ...j, probe, sig: signature(faceSpec(j.face, j.family), probe) };
+    }).filter(j => j.sig !== signature(faceSpec(j.face, "font-ripper-nonexistent"), j.probe));
+    const assignments = new Map(); // url -> { families, how }
+    let tmpId = 0;
+    await pool([...files].filter(([, f]) => f.bytes), 4, async ([url, f]) => {
+      const metric = new Set();
+      const tmpFaces = new Map();
+      // Files the page never loaded can't be behind a loaded face — names are enough for those
+      for (const j of f.source === "page source" ? [] : loadedJsFaces) {
+        const desc = [j.face.weight, j.face.style, j.face.stretch, j.face.unicodeRange].join("|");
+        if (!tmpFaces.has(desc)) {
+          // Temp copy of the file with the face's descriptors, so synthesis and unicode-range behave identically
+          const tmp = "font-ripper-sig-" + tmpId++;
+          const face = new FontFace(tmp, f.bytes, { weight: j.face.weight, style: j.face.style, stretch: j.face.stretch, unicodeRange: j.face.unicodeRange });
+          tmpFaces.set(desc, face.load().then(() => { document.fonts.add(face); return { face, tmp }; }).catch(() => null));
+        }
+        const t = await tmpFaces.get(desc);
+        if (t && signature(faceSpec(j.face, t.tmp), j.probe) === j.sig) metric.add(j.family);
+      }
+      for (const p of tmpFaces.values()) { const t = await p; if (t) document.fonts.delete(t.face); }
+      const byName = nameHits(f);
+      if (metric.size) {
+        const both = [...metric].filter(fam => byName.includes(fam));
+        assignments.set(url, both.length
+          ? { families: both, how: "matched by glyph metrics + font name" }
+          : { families: [...metric], how: "matched by glyph metrics" });
+      } else if (byName.length) {
+        assignments.set(url, { families: byName, how: "matched by font name only" });
+      }
+    });
+
+    // Emit JS / loaded / page-source files
+    let previewId = 0;
+    const previewFaces = new Map(); // group label -> tmp family used for preview
+    for (const [url, f] of files) {
+      const a = assignments.get(url);
+      const internal = f.info ? `${f.info.family} ${f.info.subfamily}`.trim() : "";
+      const sourceNote = f.source === "page source" ? "not loaded yet — referenced in page source" : "loaded by the page outside CSS";
+      if (a) {
+        const fams = a.families;
+        const ambiguous = fams.length > 1 ? ` · ambiguous: identical glyphs in ${fams.join(", ")}` : "";
+        for (const fam of fams) add(fam, [url, ...(f.aliases || [])], `/* JS FontFace, ${a.how}${ambiguous}${internal ? " · internal name: " + internal : ""} */`, "JS FontFace");
+        continue;
+      }
+      // Unattributed: group by internal family name, register a preview face with the file's own weight/style
+      const label = (f.info && f.info.family) || fileName(url);
+      if (!previewFaces.has(label)) previewFaces.set(label, "font-ripper-" + previewId++);
+      const family = previewFaces.get(label);
+      if (f.bytes) {
+        try {
+          const face = new FontFace(family, f.bytes, f.info ? { weight: String(f.info.weight), style: f.info.italic ? "italic" : "normal" } : {});
+          await face.load();
+          document.fonts.add(face);
+        } catch {}
+      }
+      add(family, [url, ...(f.aliases || [])], `/* ${sourceNote}${internal ? " · internal name: " + internal : ""}${f.info ? ` · weight ${f.info.weight}${f.info.italic ? " italic" : ""}` : ""} */`, f.source, label);
+    }
 
     // Group by family
     const grouped = new Map();
-    for (const { family, entry } of found.values()) {
-      if (!grouped.has(family)) grouped.set(family, []);
-      grouped.get(family).push(entry);
+    for (const { family, label, entry } of found.values()) {
+      if (!grouped.has(family)) grouped.set(family, { name: label || family, entries: [] });
+      grouped.get(family).entries.push(entry);
     }
     const result = [];
-    for (const [family, entries] of grouped.entries()) result.push({ family, entries });
-    return result;
+    for (const [family, { name, entries }] of grouped.entries()) result.push({ family, name, entries });
+    return { fonts: result, foreignFrames };
   }
 
   /* ── ZIP download helpers ── */
   async function loadJSZip() {
     if (window.JSZip) return window.JSZip;
+    // ESM import works on Trusted Types pages where assigning script.src is blocked
+    try { return (await import("https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm")).default; } catch {}
     await new Promise((res, rej) => {
       const s = document.createElement("script");
       s.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
@@ -150,14 +496,14 @@ javascript:(async()=>{
     // Count how many families share the same sanitized base name
     const baseCounts = new Map();
     for (const font of selectedFonts) {
-      const base = sanitizeName(font.family);
+      const base = sanitizeName(font.name);
       baseCounts.set(base, (baseCounts.get(base) || 0) + 1);
     }
     // Assign unique folder names: same-base families get _1, _2, …
     const baseIdx = new Map();
     const folderMap = new Map();
     for (const font of selectedFonts) {
-      const base = sanitizeName(font.family);
+      const base = sanitizeName(font.name);
       if (baseCounts.get(base) === 1) {
         folderMap.set(font.family, base);
       } else {
@@ -214,7 +560,7 @@ javascript:(async()=>{
   }
 
   /* ── Display UI ── */
-  function showUI(fonts) {
+  function showUI({ fonts, foreignFrames }) {
     if (fonts.length === 0) {
       overlay.remove();
       splashStyle.remove();
@@ -260,12 +606,13 @@ javascript:(async()=>{
       #font-inspector-overlay .font-style-note{font-size:12px;font-style:italic;opacity:.7;margin-left:18px}
       #font-inspector-overlay hr{margin:10px 0;border:none;border-top:1px solid var(--fg-color,#000)}
       #font-inspector-overlay .font-checkbox{width:16px;height:16px;cursor:pointer;flex-shrink:0;accent-color:var(--fg-color,#000)}
+      #font-inspector-overlay .frames-note{margin-bottom:25px;border-bottom:1px solid var(--fg-color,#000);padding-bottom:10px;font-size:14px}
       #font-inspector-overlay .dl-status{font-size:13px;opacity:.7;min-width:160px}
     `;
     document.head.appendChild(uiStyle);
 
-    overlay.innerHTML = "";
-    overlay.style = "";
+    overlay.replaceChildren();
+    overlay.removeAttribute("style");
 
     /* top controls bar */
     const controls = document.createElement("div");
@@ -284,14 +631,15 @@ javascript:(async()=>{
     controls.appendChild(closeBtn);
 
     const fgLabel = document.createElement("label");
-    fgLabel.innerHTML = 'Foreground <input type="color" value="#000000">';
-    const fgInput = fgLabel.querySelector("input");
+    const colorInput = value => Object.assign(document.createElement("input"), { type: "color", value });
+    const fgInput = colorInput("#000000");
+    fgLabel.append("Foreground ", fgInput);
     fgInput.oninput = () => overlay.style.setProperty("--fg-color", fgInput.value);
     controls.appendChild(fgLabel);
 
     const bgLabel = document.createElement("label");
-    bgLabel.innerHTML = 'Background <input type="color" value="#ffffff">';
-    const bgInput = bgLabel.querySelector("input");
+    const bgInput = colorInput("#ffffff");
+    bgLabel.append("Background ", bgInput);
     bgInput.oninput = () => overlay.style.setProperty("--bg-color", bgInput.value);
     controls.appendChild(bgLabel);
 
@@ -311,6 +659,23 @@ javascript:(async()=>{
     controls.appendChild(statusEl);
 
     overlay.appendChild(controls);
+
+    /* cross-origin iframes can't be read from here — link them so the bookmarklet can be run inside */
+    if (foreignFrames.length) {
+      const framesNote = document.createElement("details");
+      framesNote.className = "frames-note";
+      const framesSummary = document.createElement("summary");
+      framesSummary.textContent = `${foreignFrames.length} cross-origin iframe${foreignFrames.length === 1 ? "" : "s"} not scanned — open and run the bookmarklet there`;
+      const framesList = document.createElement("ul");
+      foreignFrames.forEach(src => {
+        const li = document.createElement("li");
+        const a = Object.assign(document.createElement("a"), { href: src, target: "_blank", className: "font-link", textContent: src });
+        li.appendChild(a);
+        framesList.appendChild(li);
+      });
+      framesNote.append(framesSummary, framesList);
+      overlay.appendChild(framesNote);
+    }
 
     const placeholder = `${fonts.length} famil${fonts.length === 1 ? "y" : "ies"} found`;
 
@@ -382,7 +747,7 @@ javascript:(async()=>{
 
       const details = document.createElement("details");
       const summary = document.createElement("summary");
-      summary.textContent = font.family;
+      summary.textContent = font.name;
       details.appendChild(summary);
 
       font.entries.forEach((entry, idx) => {
@@ -413,7 +778,7 @@ javascript:(async()=>{
       const preview = document.createElement("div");
       preview.className = "font-preview";
       preview.textContent = "The quick brown fox jumps over the lazy dog\nPříliš žluťoučký kůň úpěl ďábelské ódy";
-      preview.style.fontFamily = font.family;
+      preview.style.fontFamily = `"${font.family}"`;
       sample.appendChild(preview);
 
       const blockControls = document.createElement("div");
@@ -461,6 +826,5 @@ javascript:(async()=>{
   }
 
   /* ── Run ── */
-  const fonts = await extractFonts();
-  showUI(fonts);
+  showUI(await extractFonts());
 })();

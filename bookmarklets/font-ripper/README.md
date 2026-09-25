@@ -14,11 +14,18 @@ Navigate to any webpage and click the bookmark. A full-screen overlay will appea
 
 ## What it does
 
-**Font discovery — three passes:**
+**Font discovery — every source combined:**
 
-1. **CSS rules** — reads `cssRules` from all stylesheets, including those in shadow DOM roots.
-2. **Inline `<style>` tags** — regex-scans `<style>` blocks to catch fonts that may not be exposed via `cssRules`.
-3. **CORS-blocked external sheets** — fetches cross-origin stylesheets via `fetch()` and parses them with regex, catching fonts that the browser blocks from JS access.
+1. **CSSOM** — `cssRules` of all stylesheets in the page, shadow roots, adopted sheets and same-origin iframes, recursing into `@import` and `@media`/`@supports`/`@layer` blocks.
+2. **Inline `<style>` tags** — regex scan for rules the CSSOM may not expose.
+3. **CORS-blocked sheets** — fetched and regex-parsed, following their `@import`s.
+4. **JS FontFace fonts** — families added via `new FontFace()` + `document.fonts.add()` (typical for type testers). Unloaded ones are loaded so their files become visible.
+5. **Resource timing** — every file the page downloaded (fetch/XHR/CSS, any URL shape — also extension-less endpoints like Typekit or `/tester/file/<id>`), verified as a font by magic bytes.
+6. **Page source** — font file paths referenced in HTML / embedded JSON (e.g. styles of a type tester that haven't been selected yet), resolved against the page and known font directories and verified by magic bytes.
+
+**Identification:** each non-CSS file's internal names are read from its `name`/`OS/2` tables (WOFF2 via an on-demand brotli decoder from jsDelivr; if CSP blocks it, metrics alone are used). Files are matched to JS families by glyph metrics (advance widths + ink bounds rendered under the face's own weight/style/stretch/unicode-range, probing only code points unique to that face) combined with the internal name as tie-breaker. If a file matches several families, it is listed under all of them and flagged *ambiguous*. Unmatched files are grouped by their internal family name with a working preview. Identical files (same SHA-1) under different URLs are merged.
+
+**Not reachable from a bookmarklet:** cross-origin iframes (listed at the top with links — run the bookmarklet there), fonts created from an `ArrayBuffer` whose bytes were decrypted in JS, and text rendered server-side into images.
 
 Fonts are deduplicated and grouped by family name.
 
