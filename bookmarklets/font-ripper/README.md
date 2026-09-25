@@ -4,7 +4,7 @@ A bookmarklet that discovers all `@font-face` fonts on any webpage and displays 
 
 ## Installation
 
-Open **[the install page](https://highda.github.io/vibecode-snippets/bookmarklets/font-ripper/)** and drag the *Font Ripper* button to your bookmarks bar. The page is built from `minified.js` on `main`, so it always installs the latest version.
+Open **[the install page](https://highda.github.io/vibecode-snippets/font-ripper.html)** and drag the *Font Ripper* button to your bookmarks bar. The page builds the bookmark from `minified.js` on `main` of this repo, so a push here goes live within ~5 minutes (raw.githubusercontent.com cache).
 
 Manual alternative: copy the contents of `minified.js` and paste it as the URL of a new bookmark.
 
