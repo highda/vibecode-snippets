@@ -1012,9 +1012,36 @@ javascript:(async()=>{
     return chars.filter((ch, i) => own[i] !== blank && inked(own[i]) && !/[\p{M}\p{Cc}\p{Cf}\p{Cs}\p{Z}]/u.test(ch));
   }
   const withTimeout = (promise, ms) => Promise.race([promise, new Promise(r => setTimeout(r, ms))]);
-  async function fitPreview(preview, family) {
-    const faces = [...document.fonts].filter(f => cleanFamily(f.family) === family);
-    if (!faces.length) return;
+  // Families found only as text (CSS that isn't applied, @font-face inside scripts) aren't registered on the
+  // page, so a preview has nothing to draw with: register its files under a private name, with the
+  // descriptors from its @font-face rule
+  let viewId = 0;
+  async function registerPreviewFaces(font) {
+    const name = "font-ripper-view-" + viewId++;
+    let added = 0;
+    for (const entry of font.entries.slice(0, 12)) {
+      const url = entry.urls.find(u => !/\.(eot|svg)(\?|#|$)/i.test(u));
+      if (!url) continue;
+      let bytes = knownBytes.get(url);
+      if (!bytes) { try { const r = await get(url); if (r.ok) bytes = new Uint8Array(await r.arrayBuffer()); } catch {} }
+      if (!bytes || bytes.length < 12 || !MAGIC.includes(tagAt(bytes, 0))) continue;
+      const descriptors = {};
+      for (const [key, prop] of [["weight", "font-weight"], ["style", "font-style"], ["stretch", "font-stretch"], ["unicodeRange", "unicode-range"]]) {
+        const m = entry.style.match(new RegExp(prop + "\\s*:\\s*([^;}]+)", "i"));
+        if (m) descriptors[key] = m[1].trim();
+      }
+      try { const face = new FontFace(name, bytes, descriptors); await face.load(); document.fonts.add(face); added++; } catch {}
+    }
+    return added ? name : null;
+  }
+  async function fitPreview(preview, family, font) {
+    let faces = [...document.fonts].filter(f => cleanFamily(f.family) === family);
+    if (!faces.length || faces.every(f => f.status === "error")) {
+      family = await registerPreviewFaces(font);
+      if (!family) return;
+      preview.style.fontFamily = `"${family}", "font-ripper-missing"`;
+      faces = [...document.fonts].filter(f => cleanFamily(f.family) === family);
+    }
     await loadBlank();
     await withTimeout(document.fonts.load(`100px "${family}"`, PREVIEW_TEXT).catch(() => {}), 3000);
     const own = [...new Set(PREVIEW_TEXT.replace(/\s/g, ""))];
@@ -1451,10 +1478,10 @@ javascript:(async()=>{
 
       sample.appendChild(blockControls);
       overlay.appendChild(sample);
-      previews.push([preview, font.family]);
+      previews.push([preview, font]);
     });
     // After rendering, one family at a time: swap in the font's own glyphs where the pangram isn't covered
-    (async () => { for (const [preview, family] of previews) { if (!preview.isConnected) return; try { await fitPreview(preview, family); } catch {} } })();
+    (async () => { for (const [preview, font] of previews) { if (!preview.isConnected) return; try { await fitPreview(preview, font.family, font); } catch {} } })();
   }
 
   /* ── Run ── */
