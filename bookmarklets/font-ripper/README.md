@@ -44,13 +44,9 @@ Fonts are deduplicated and grouped by family name.
 
 - Expandable per-family list of all font file URLs (clickable, open in new tab)
 - CSS descriptor summary (weight, style, unicode-range, etc.) shown beneath each URL list
-- Live preview text rendered in the actual font — English pangram + Czech pangram
+- Live preview text rendered in the actual font — English pangram + Czech pangram; fonts that draw none of it (symbol/icon fonts) show a sample of their own glyphs instead, found by rendering against a built-in all-Unicode blank fallback
 - Per-font toggles: **Bold**, *Italic*, Underline
 - Editable preview text (pencil button)
 - Font size control (in em)
 - Global foreground/background color pickers for testing contrast
 - Close button that restores the page scroll state
-
-## Benchmark
-
-`bench/` holds the test setup; see [bench/README.md](bench/README.md).

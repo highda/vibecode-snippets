@@ -986,6 +986,61 @@ javascript:(async()=>{
     return { fonts: result, foreignFrames, blockedSheets: [...blockedSheets], rtWasFull, orphanCount: orphans.size, workerFonts };
   }
 
+  /* ── Preview text: fonts without the pangram's characters (symbol / icon fonts) show their own glyphs ── */
+  const PREVIEW_TEXT = "The quick brown fox jumps over the lazy dog\nPříliš žluťoučký kůň úpěl ďábelské ódy";
+  // Blocks probed when a font's faces claim the whole Unicode range: Latin, Greek, Cyrillic, punctuation,
+  // currency, letterlike, arrows, math, technical, enclosed, box/geometric, symbols/dingbats, PUA, emoji
+  const PROBE_BLOCKS = [[0x21, 0x24f], [0x370, 0x3ff], [0x400, 0x4ff], [0x2000, 0x206f], [0x20a0, 0x20cf], [0x2100, 0x218f], [0x2190, 0x21ff], [0x2200, 0x22ff], [0x2300, 0x23ff], [0x2460, 0x24ff], [0x2500, 0x25ff], [0x2600, 0x27bf], [0x2b00, 0x2bff], [0xe000, 0xf8ff], [0x1f300, 0x1faff], [0xf0000, 0xf00ff]];
+  const previewCtx = document.createElement("canvas").getContext("2d");
+  // A 608-byte font that maps all of Unicode to one empty glyph: as the only fallback it rules out system
+  // font fallback, so a character renders as this blank glyph exactly when the family lacks it
+  const BLANK_FONT = "AAEAAAAKAIAAAwAgT1MvMkUBQ7QAAAEoAAAAYGNtYXAAIrhhAAABkAAAADRnbHlmAAAAAAAAAcwAAAABaGVhZCzUC4QAAACsAAAANmhoZWEDIgFTAAAA5AAAACRobXR4AhkAAAAAAYgAAAAGbG9jYQAAAAAAAAHEAAAABm1heHAAAwACAAABCAAAACBuYW1lA5pQxAAAAdAAAABjcG9zdG1nc80AAAI0AAAALAABAAAAAQAA1SkCF18PPPUAAwPoAAAAAObe5VIAAAAA5t7lUgAAAAAAAAAAAAAAAwACAAAAAAAAAAEAAAMg/zgAAAIZAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAEAAAACAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAwIZAZAABQAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAPz8/PwAAACD//wMg/zgAAAMgAMgAAAAAAAAAAAAAAAAAAAAgAAACGQAAAAAAAAAAAAEAAwAKAAAADAANAAAAAAAoAAAAAAAAAAIAAAAgAADX/wAAAAEAAOAAABD//wAAAAEAAAAAAAAAAAAAAAAAAAAEADYAAQAAAAAAAQAIAAAAAQAAAAAAAgAHAAgAAwABBAkAAQAQAA8AAwABBAkAAgAOAB9GUiBCbGFua1JlZ3VsYXIARgBSACAAQgBsAGEAbgBrAFIAZQBnAHUAbABhAHIAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAQIFYmxhbms=";
+  let blankReady;
+  const loadBlank = () => blankReady ||= (async () => {
+    const face = new FontFace("font-ripper-blank", Uint8Array.from(atob(BLANK_FONT), c => c.charCodeAt(0)));
+    await face.load();
+    document.fonts.add(face);
+  })().catch(() => {});
+  function coveredChars(family, chars) {
+    const measure = (font, list) => { previewCtx.font = font; return list.map(ch => { const m = previewCtx.measureText(ch); return [m.width, m.actualBoundingBoxLeft, m.actualBoundingBoxRight, m.actualBoundingBoxAscent, m.actualBoundingBoxDescent].map(v => v.toFixed(1)).join(":"); }); };
+    const [blank] = measure('100px "font-ripper-blank"', ["A"]);
+    const own = measure(`100px "${family}", "font-ripper-blank"`, chars);
+    // Only glyphs with visible ink count (icon fonts map letters to empty glyphs); marks, format/control
+    // characters and spaces render as nothing whatever the font
+    const inked = s => { const [, left, right, ascent, descent] = s.split(":").map(Number); return left + right > 0 && ascent + descent > 0; };
+    return chars.filter((ch, i) => own[i] !== blank && inked(own[i]) && !/[\p{M}\p{Cc}\p{Cf}\p{Cs}\p{Z}]/u.test(ch));
+  }
+  const withTimeout = (promise, ms) => Promise.race([promise, new Promise(r => setTimeout(r, ms))]);
+  async function fitPreview(preview, family) {
+    const faces = [...document.fonts].filter(f => cleanFamily(f.family) === family);
+    if (!faces.length) return;
+    await loadBlank();
+    await withTimeout(document.fonts.load(`100px "${family}"`, PREVIEW_TEXT).catch(() => {}), 3000);
+    const own = [...new Set(PREVIEW_TEXT.replace(/\s/g, ""))];
+    if (coveredChars(family, own).length) return; // draws at least part of the pangram: keep it
+    await withTimeout(Promise.allSettled(faces.map(f => f.load())), 4000);
+    const ranges = faces.flatMap(f => parseRange(f.unicodeRange));
+    const probeRanges = ranges.some(([a, b]) => a === 0 && b >= 0x10ffff) ? PROBE_BLOCKS : ranges;
+    const chars = [];
+    for (const [a, b] of probeRanges) {
+      for (let c = Math.max(a, 0x21); c <= b && chars.length < 12000; c++) {
+        if ((c >= 0x7f && c <= 0xa0) || (c >= 0xd800 && c <= 0xdfff)) continue;
+        chars.push(String.fromCodePoint(c));
+      }
+    }
+    const found = coveredChars(family, chars).slice(0, 48);
+    if (!found.length) {
+      // Blank fonts (Adobe Blank) or faces that failed to load: say so instead of showing fallback text
+      preview.textContent = "No visible glyphs found in this font";
+      preview.style.fontFamily = "sans-serif";
+      preview.style.opacity = ".6";
+      return;
+    }
+    const lines = [];
+    for (let i = 0; i < found.length; i += 12) lines.push(found.slice(i, i + 12).join(" "));
+    preview.textContent = lines.join("\n");
+  }
+
   /* ── ZIP download helpers ── */
   // Minimal ZIP writer (stored, no compression — font files are compressed already). Inline because
   // strict CSP pages block loading a ZIP library from a CDN.
@@ -1301,6 +1356,7 @@ javascript:(async()=>{
     };
 
     /* font entries */
+    const previews = [];
     fonts.forEach((font, fontIdx) => {
       const sample = document.createElement("div");
       sample.className = "font-sample";
@@ -1348,7 +1404,7 @@ javascript:(async()=>{
 
       const preview = document.createElement("div");
       preview.className = "font-preview";
-      preview.textContent = "The quick brown fox jumps over the lazy dog\nPříliš žluťoučký kůň úpěl ďábelské ódy";
+      preview.textContent = PREVIEW_TEXT;
       preview.style.fontFamily = `"${font.family}"`;
       sample.appendChild(preview);
 
@@ -1393,7 +1449,10 @@ javascript:(async()=>{
 
       sample.appendChild(blockControls);
       overlay.appendChild(sample);
+      previews.push([preview, font.family]);
     });
+    // After rendering, one family at a time: swap in the font's own glyphs where the pangram isn't covered
+    (async () => { for (const [preview, family] of previews) { if (!preview.isConnected) return; try { await fitPreview(preview, family); } catch {} } })();
   }
 
   /* ── Run ── */
