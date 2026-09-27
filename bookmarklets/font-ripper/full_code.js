@@ -1137,7 +1137,8 @@ javascript:(async()=>{
     const uiStyle = document.createElement("style");
     uiStyle.setAttribute("type", "text/css");
     uiStyle.textContent = `
-      #font-inspector-overlay,#font-inspector-overlay *{all:revert;font-family:sans-serif;box-sizing:border-box;line-height:unset !important}
+      #font-inspector-overlay,#font-inspector-overlay *{all:revert;font-family:sans-serif;box-sizing:border-box;line-height:1.4 !important}
+      #font-inspector-overlay .font-preview{line-height:normal !important}
       #font-inspector-overlay{position:fixed;inset:0;z-index:2147483647;overflow-y:auto;overscroll-behavior:contain;padding:64px 20px 20px;background:var(--bg-color,#fff);color:var(--fg-color,#000)}
       #font-inspector-overlay .font-sample{margin-bottom:25px;border-bottom:1px solid var(--fg-color,#000);padding-bottom:10px}
       #font-inspector-overlay .font-title{font-weight:700;font-size:16px;margin-bottom:6px;display:flex;align-items:center;gap:8px}
