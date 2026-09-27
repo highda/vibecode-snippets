@@ -18,14 +18,36 @@ javascript:(async()=>{
       border-radius:50%;animation:fi-spin .6s linear infinite;margin-right:12px;
     }
     @keyframes fi-spin{to{transform:rotate(360deg)}}
+    #font-inspector-overlay .splash-col{display:flex;flex-direction:column;gap:8px;min-width:280px}
+    #font-inspector-overlay .splash-bar{height:4px;background:#e5e5e5;border-radius:2px;overflow:hidden}
+    #font-inspector-overlay .splash-fill{height:100%;width:0;background:#000;transition:width .2s}
+    #font-inspector-overlay .splash-pct{font-size:14px;font-variant-numeric:tabular-nums;opacity:.7}
   `;
   document.head.appendChild(splashStyle);
   const spinner = document.createElement("div");
   spinner.className = "spinner";
   const splashText = document.createElement("span");
   splashText.textContent = "Loading fonts…";
-  overlay.append(spinner, splashText);
+  const splashCol = Object.assign(document.createElement("div"), { className: "splash-col" });
+  const splashBar = Object.assign(document.createElement("div"), { className: "splash-bar" });
+  const splashFill = Object.assign(document.createElement("div"), { className: "splash-fill" });
+  const splashPct = Object.assign(document.createElement("span"), { className: "splash-pct", textContent: "0 %" });
+  splashBar.appendChild(splashFill);
+  splashCol.append(splashText, splashBar, splashPct);
+  overlay.append(spinner, splashCol);
   document.body.appendChild(overlay);
+
+  // Percent progress. Each scan phase owns a slice of 0–100; long phases advance per item within it.
+  // Never moves backwards; a second step (recovery) restarts it with its own label.
+  let progressShown = 0, progressStep = "", progressRange = [0, 100];
+  const setProgress = pct => {
+    const [lo, hi] = progressRange;
+    const v = Math.max(progressShown, Math.min(100, Math.round(lo + (hi - lo) * Math.min(100, pct) / 100)));
+    progressShown = v;
+    splashFill.style.width = v + "%";
+    splashPct.textContent = progressStep + v + " %";
+  };
+  const slice = (from, to) => { setProgress(from); return (done, total) => setProgress(from + (to - from) * (total ? Math.min(1, done / total) : 1)); };
   // Phase timings + request counts, readable as window.__fontRipperStats (used by the benchmark)
   const stats = window.__fontRipperStats = { phases: [], fetches: 0, t0: performance.now() };
   const setSplash = msg => { splashText.textContent = msg; stats.phases.push([msg, Math.round(performance.now() - stats.t0)]); };
@@ -163,12 +185,14 @@ javascript:(async()=>{
 
   /* ── Run async tasks with limited concurrency ── */
   // budgetMs: stop starting new items after that long (speculative work on huge pages)
-  async function pool(items, limit, fn, budgetMs = Infinity) {
-    let i = 0;
+  // tick(done, total): progress callback after each item
+  async function pool(items, limit, fn, budgetMs = Infinity, tick) {
+    let i = 0, done = 0;
     const end = performance.now() + budgetMs;
     await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-      while (i < items.length && performance.now() < end) { const item = items[i++]; await fn(item); }
+      while (i < items.length && performance.now() < end) { const item = items[i++]; await fn(item); if (tick) tick(++done, items.length); }
     }));
+    if (tick) tick(items.length, items.length);
   }
 
   /* ── Binary font parsing: sniff format, read name + OS/2 tables ── */
@@ -455,6 +479,7 @@ javascript:(async()=>{
 
     // Pass 3: fetch CORS-blocked sheets and follow their @imports; also sheets that were loaded but are gone
     // from the CSSOM (removed <link>, closed shadow roots)
+    setProgress(5);
     setSplash("Fetching cross-origin stylesheets…");
     for (const { e } of rtEntries) if (/\.css(\?|#|$)/i.test(e.name) && !walkedHrefs.has(e.name)) unreadable.add(e.name);
     const fetchedSheets = new Set();
@@ -495,6 +520,7 @@ javascript:(async()=>{
     stats.jsFaces = jsFaces.length;
     const pending = jsFaces.filter(({ face }) => face.status === "unloaded");
     if (pending.length) {
+      setProgress(10);
       setSplash(`Loading ${pending.length} unused JS fonts…`);
       await Promise.race([
         Promise.allSettled(pending.map(({ face }) => face.load())),
@@ -522,6 +548,7 @@ javascript:(async()=>{
     // Pass 6: page source, scripts, workers, JSON and web storage as text. Font data hides there as
     // @font-face CSS (CSS-in-JS, <template>, <noscript>), new FontFace("x", "url(…)") calls, plain font paths
     // (type-tester style lists) and base64 blobs.
+    setProgress(14);
     setSplash("Scanning page source and scripts…");
     const mark = k => { (stats.marks ||= []).push([k, Math.round(performance.now() - stats.t0)]); };
     const texts = []; // { text, base }
@@ -552,6 +579,7 @@ javascript:(async()=>{
       if (/\.(m?js|json)(\?|#|$)/i.test(e.name) || (e.initiatorType === "script" && !NON_FONT_EXT.test(e.name))) scriptUrls.add(e.name);
     }
     mark("script urls");
+    setProgress(18);
     setSplash(`Reading ${Math.min(scriptUrls.size, 150)} scripts…`);
     stats.scripts = scriptUrls.size;
     // Worker scripts show up in resource timing as "other"; one that builds FontFaces is a reason to re-run
@@ -564,7 +592,7 @@ javascript:(async()=>{
         if (text.length < 20e6) texts.push({ text, base: url });
         if (workerScripts.has(url) && /FontFace\s*\(/.test(text)) workerFonts = true;
       } catch {}
-    }, 8000);
+    }, 8000, slice(18, 34));
 
     const fontDirs = new Set([...claimed, ...[...candidates.keys()].filter(u => FONT_EXT.test(u))]
       .filter(u => /^https?:/.test(u)).map(u => u.replace(/[^/]*$/, "")));
@@ -602,8 +630,11 @@ javascript:(async()=>{
     };
     setSplash(`Scanning ${texts.length} texts…`);
     stats.textBytes = texts.reduce((n, x) => n + x.text.length, 0);
-    texts.forEach(scanText);
-    setSplash(`Checking ${cssRefs.size} referenced stylesheets…`);    // Stylesheets only mentioned in source: fetch and parse (one level of @import). Relative paths
+    const scanned = slice(34, 40);
+    texts.forEach((x, i) => { scanText(x); scanned(i + 1, texts.length); });
+    setSplash(`Checking ${cssRefs.size} referenced stylesheets…`);
+    const cssProgress = slice(40, 45);
+    // Stylesheets only mentioned in source: fetch and parse (one level of @import). Relative paths
     // ("static/css/x.css" in a build manifest) are also tried under known stylesheet folders ending in their folder.
     const sheetDirs = [...new Set([...walkedHrefs, ...fetchedSheets].filter(u => /^https?:/.test(u)).map(u => u.replace(/[^/]*$/, "")))];
     const cssTries = ref => {
@@ -637,11 +668,12 @@ javascript:(async()=>{
           next.push(...imports.map(u => [u]));
           return;
         }
-      }, 5000);
+      }, 5000, depth ? undefined : cssProgress);
       queue = next;
     }
 
     // Pass 7: binary stores — CacheStorage (service-worker caches) and IndexedDB
+    setProgress(45);
     setSplash("Checking browser storage…");
     const storeFiles = []; // { url, bytes }
     const blobs = [];
@@ -738,6 +770,7 @@ javascript:(async()=>{
     };
 
     // Verify candidates by magic bytes and keep the bytes for naming/matching
+    setProgress(50);
     setSplash("Verifying font files…");
     const files = new Map(); // url -> { bytes, source, family? }
     const fetchFont = async url => {
@@ -758,12 +791,13 @@ javascript:(async()=>{
       try { bytes = await fetchFont(url); } catch {}
       if (bytes) files.set(url, { bytes, source: c.source });
       else if (c.knownFont) files.set(url, { bytes: null, source: c.source }); // unreadable (CORS) but clearly a font
-    });
+    }, Infinity, slice(50, 62));
     // Resolve after resource-timing candidates: JSON responses scanned while verifying them add paths too
     const refCandidates = resolveRefs();
     stats.sourceRefs = refCandidates.length;
     stats.sourceUrls = refCandidates.reduce((n, c) => n + c.tries.length, 0);
     setSplash(`Checking ${refCandidates.length} font paths from page source…`);
+    const refProgress = slice(62, 78);
     // A way of resolving that keeps missing (10 misses, no hit) is dropped for the remaining paths
     const kindHits = {}, kindMisses = {};
     const REF_LIMIT = 400;
@@ -771,6 +805,7 @@ javascript:(async()=>{
     const checking = Math.min(refCandidates.length, REF_LIMIT);
     await pool(refCandidates.slice(0, REF_LIMIT), 12, async ({ tries, family }) => {
       if (++checked % 10 === 0) splashText.textContent = `Checking font paths from page source… ${checked}/${checking}`;
+      refProgress(checked, checking);
       for (const { url, kind } of tries) {
         if (files.has(url)) { if (family) files.get(url).family = family; return; }
         if (!kindHits[kind] && kindMisses[kind] >= 10) continue;
@@ -803,7 +838,11 @@ javascript:(async()=>{
 
     // Identify files: internal names + content hash (identical bytes = same font)
     setSplash(`Identifying ${files.size} font files…`);
+    const identified = slice(78, 88);
+    let identifiedCount = 0;
+    const identifyTotal = files.size;
     for (const [url, f] of files) {
+      identified(++identifiedCount, identifyTotal);
       if (!f.bytes) continue;
       const known = infoCache.get(f.bytes);
       if (known) { Object.assign(f, known); if (!f.info && (f.source === "embedded" || f.source === "storage")) files.delete(url); continue; }
@@ -887,8 +926,9 @@ javascript:(async()=>{
       } else if (byName.length) {
         assignments.set(url, { families: byName, how: "matched by font name only" });
       }
-    });
+    }, Infinity, slice(88, 98));
 
+    setProgress(98);
     // Emit JS / loaded / page-source files
     const sourceNotes = {
       "page source": "not loaded yet — referenced in page source or scripts",
@@ -942,6 +982,7 @@ javascript:(async()=>{
     }
     const result = [];
     for (const [family, { name, entries }] of grouped.entries()) result.push({ family, name, entries });
+    setProgress(100);
     return { fonts: result, foreignFrames, blockedSheets: [...blockedSheets], rtWasFull, orphanCount: orphans.size, workerFonts };
   }
 
@@ -1059,7 +1100,7 @@ javascript:(async()=>{
       }
 
       done++;
-      statusCb(`Fetching fonts… ${done}/${selectedFonts.length}`);
+      statusCb(`Fetching fonts… ${done}/${selectedFonts.length} (${Math.round(done / selectedFonts.length * 100)} %)`);
     });
 
     if (failed.length) zipEntries.push({ name: "_not-downloaded.txt", bytes: new TextEncoder().encode(failed.join("\n") + "\n") });
@@ -1360,8 +1401,18 @@ javascript:(async()=>{
   let result = await extractFonts();
   if ((result.orphanCount || result.workerFonts) && !window.__fontRipperRecovered) {
     window.__fontRipperRecovered = true;
+    progressShown = 0;
+    progressStep = "Step 2 of 2 · ";
+    setProgress(0);
     setSplash(result.orphanCount ? `Recovering ${result.orphanCount} font famil${result.orphanCount === 1 ? "y" : "ies"} built from memory…` : "Recovering fonts built inside workers…");
-    if (await captureInFrame()) result = await extractFonts();
+    // Re-running the page takes up to ~15 s: its share is the first 40 %, the rescan the rest
+    progressRange = [0, 40];
+    const tStart = Date.now();
+    const timer = setInterval(() => setProgress(Math.min(99, (Date.now() - tStart) / 15000 * 100)), 250);
+    const got = await captureInFrame();
+    clearInterval(timer);
+    progressRange = [40, 100];
+    if (got) result = await extractFonts();
     result.recovered = true;
   }
   showUI(result);
