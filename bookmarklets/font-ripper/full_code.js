@@ -992,19 +992,20 @@ javascript:(async()=>{
   // currency, letterlike, arrows, math, technical, enclosed, box/geometric, symbols/dingbats, PUA, emoji
   const PROBE_BLOCKS = [[0x21, 0x24f], [0x370, 0x3ff], [0x400, 0x4ff], [0x2000, 0x206f], [0x20a0, 0x20cf], [0x2100, 0x218f], [0x2190, 0x21ff], [0x2200, 0x22ff], [0x2300, 0x23ff], [0x2460, 0x24ff], [0x2500, 0x25ff], [0x2600, 0x27bf], [0x2b00, 0x2bff], [0xe000, 0xf8ff], [0x1f300, 0x1faff], [0xf0000, 0xf00ff]];
   const previewCtx = document.createElement("canvas").getContext("2d");
-  // A 608-byte font that maps all of Unicode to one empty glyph: as the only fallback it rules out system
-  // font fallback, so a character renders as this blank glyph exactly when the family lacks it
-  const BLANK_FONT = "AAEAAAAKAIAAAwAgT1MvMkUBQ7QAAAEoAAAAYGNtYXAAIrhhAAABkAAAADRnbHlmAAAAAAAAAcwAAAABaGVhZCzUC4QAAACsAAAANmhoZWEDIgFTAAAA5AAAACRobXR4AhkAAAAAAYgAAAAGbG9jYQAAAAAAAAHEAAAABm1heHAAAwACAAABCAAAACBuYW1lA5pQxAAAAdAAAABjcG9zdG1nc80AAAI0AAAALAABAAAAAQAA1SkCF18PPPUAAwPoAAAAAObe5VIAAAAA5t7lUgAAAAAAAAAAAAAAAwACAAAAAAAAAAEAAAMg/zgAAAIZAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAEAAAACAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAwIZAZAABQAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAPz8/PwAAACD//wMg/zgAAAMgAMgAAAAAAAAAAAAAAAAAAAAgAAACGQAAAAAAAAAAAAEAAwAKAAAADAANAAAAAAAoAAAAAAAAAAIAAAAgAADX/wAAAAEAAOAAABD//wAAAAEAAAAAAAAAAAAAAAAAAAAEADYAAQAAAAAAAQAIAAAAAQAAAAAAAgAHAAgAAwABBAkAAQAQAA8AAwABBAkAAgAOAB9GUiBCbGFua1JlZ3VsYXIARgBSACAAQgBsAGEAbgBrAFIAZQBnAHUAbABhAHIAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAQIFYmxhbms=";
+  // An 848-byte font that maps all of Unicode (except spaces and controls) to one striped box. As the only
+  // fallback it rules out system font fallback: in previews a character the family lacks shows as a grey
+  // box, and on canvas it renders as exactly this glyph, which is how coverage is measured
+  const MISSING_FONT = "AAEAAAAKAIAAAwAgT1MvMkUCQ/MAAAEoAAAAYGNtYXAAJ9aMAAABkAAAAJRnbHlmHZtS1QAAAiwAAACMaGVhZC8sF9MAAACsAAAANmhoZWEFegHOAAAA5AAAACRobXR4ApQAAAAAAYgAAAAGbG9jYQBGAAAAAAIkAAAABm1heHAADQAqAAABCAAAACBuYW1lmf8c8gAAArgAAABpcG9zdHB+A2IAAAMkAAAAKgABAAAAAQAAW/lKqF8PPPUAAwPoAAAAAObe6i0AAAAA5t7qLQA8AAACHAKZAAAAAwACAAAAAAAAAAEAAAMg/zgAAAJYADwAPAIcAAEAAAAAAAAAAAAAAAAAAAABAAEAAAACACgACgAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAwJYAZAABQAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAPz8/PwAAACH//wMg/zgAAAMgAMgAAAAAAAAAAAAAAAAAAAAgAAACWAAAADwAAAAAAAEAAwAKAAAADAANAAAAAACIAAAAAAAAAAoAAAAhAAAAfgAAAAEAAAChAAAArAAAAAEAAACuAAAf/wAAAAEAACAQAAAgJwAAAAEAACAwAAAgXgAAAAEAACBwAAAv/wAAAAEAADABAADX/wAAAAEAAOAAAAD9/wAAAAEAAP4QAAD+/gAAAAEAAP8AABD//wAAAAEAAAAAAEYAAAAKADwAAAIcApkAAwAHAAsADwATABcAGwAfACMAJwAAMzUhFSU1IRUlNSEVJTUhFSU1IRUlNSEVJTUhFSU1IRUlNSEVJTUhFTwB4P4gAeD+IAHg/iAB4P4gAeD+IAHg/iAB4P4gAeD+IAHg/iAB4CMjRiMjRiMjRiMjRiMjRiMjRiMjRiMjRiMjRiMjAAAABAA2AAEAAAAAAAEACgAAAAEAAAAAAAIABwAKAAMAAQQJAAEAFAARAAMAAQQJAAIADgAlRlIgTWlzc2luZ1JlZ3VsYXIARgBSACAATQBpAHMAcwBpAG4AZwBSAGUAZwB1AGwAYQByAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAQIDYm94AAA=";
   let blankReady;
   const loadBlank = () => blankReady ||= (async () => {
-    const face = new FontFace("font-ripper-blank", Uint8Array.from(atob(BLANK_FONT), c => c.charCodeAt(0)));
+    const face = new FontFace("font-ripper-missing", Uint8Array.from(atob(MISSING_FONT), c => c.charCodeAt(0)));
     await face.load();
     document.fonts.add(face);
   })().catch(() => {});
   function coveredChars(family, chars) {
     const measure = (font, list) => { previewCtx.font = font; return list.map(ch => { const m = previewCtx.measureText(ch); return [m.width, m.actualBoundingBoxLeft, m.actualBoundingBoxRight, m.actualBoundingBoxAscent, m.actualBoundingBoxDescent].map(v => v.toFixed(1)).join(":"); }); };
-    const [blank] = measure('100px "font-ripper-blank"', ["A"]);
-    const own = measure(`100px "${family}", "font-ripper-blank"`, chars);
+    const [blank] = measure('100px "font-ripper-missing"', ["A"]);
+    const own = measure(`100px "${family}", "font-ripper-missing"`, chars);
     // Only glyphs with visible ink count (icon fonts map letters to empty glyphs); marks, format/control
     // characters and spaces render as nothing whatever the font
     const inked = s => { const [, left, right, ascent, descent] = s.split(":").map(Number); return left + right > 0 && ascent + descent > 0; };
@@ -1357,6 +1358,7 @@ javascript:(async()=>{
 
     /* font entries */
     const previews = [];
+    loadBlank(); // box glyphs for characters a font lacks
     fonts.forEach((font, fontIdx) => {
       const sample = document.createElement("div");
       sample.className = "font-sample";
@@ -1405,7 +1407,7 @@ javascript:(async()=>{
       const preview = document.createElement("div");
       preview.className = "font-preview";
       preview.textContent = PREVIEW_TEXT;
-      preview.style.fontFamily = `"${font.family}"`;
+      preview.style.fontFamily = `"${font.family}", "font-ripper-missing"`;
       sample.appendChild(preview);
 
       const blockControls = document.createElement("div");
